@@ -4,14 +4,15 @@
 //!
 //! H264 is saved as an Annex B elementary stream, the others as IVF. Prints every
 //! keyframe and one line per second of video with the measured bitrate.
+//!
+//! Connects to `$OBS_DISCORD_LIVE_ADDR`, else the plugin's default socket.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use odl_proto::{ClientMsg, ServerMsg};
+use odl_proto::{ClientMsg, ServerMsg, Stream};
 
 struct Args {
     codec: String,
@@ -68,10 +69,10 @@ fn ivf_header(fourcc: &[u8; 4], w: u32, h: u32) -> Vec<u8> {
 }
 
 fn run(a: Args) -> Result<(), String> {
-    let path = odl_proto::socket_path();
-    let mut sock = UnixStream::connect(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let addr = odl_proto::addr();
+    let mut sock = Stream::connect(&addr).map_err(|e| format!("{addr}: {e}"))?;
     let mut writer = sock.try_clone().map_err(|e| e.to_string())?;
-    let send = |w: &mut UnixStream, m: ClientMsg| {
+    let send = |w: &mut Stream, m: ClientMsg| {
         println!("-> {m:?}");
         odl_proto::write(w, &m.encode()).map_err(|e| e.to_string())
     };

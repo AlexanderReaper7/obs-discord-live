@@ -1,7 +1,8 @@
 //! Wire format between the OBS plugin and its client (the Vesktop patch, or `odl-client`).
 //!
-//! The plugin listens on a Unix stream socket, [`socket_path`]. Every message is
-//! a little-endian `u32` length of what follows, one type byte, then the payload.
+//! The plugin listens on [`addr`]: a Unix stream socket on Linux, TCP on Windows,
+//! where OBS runs in a VM guest and the client on the host. Every message is a
+//! little-endian `u32` length of what follows, one type byte, then the payload.
 //! Strings are a `u8` length and UTF-8 bytes.
 //!
 //! A session is: the client connects and sends [`ClientMsg::Start`]; the plugin
@@ -11,14 +12,139 @@
 //! replaces the old one.
 
 use std::io::{self, Read, Write};
+use std::net::{Shutdown, TcpStream};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Upper bound on one message, so a corrupt length cannot allocate gigabytes.
 pub const MAX_MESSAGE: u32 = 16 << 20;
 
-pub fn socket_path() -> PathBuf {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into());
-    PathBuf::from(dir).join("obs-discord-live.sock")
+/// Overrides [`addr`] on both sides: `HOST:PORT` for TCP, anything else is a socket path.
+pub const ADDR_ENV: &str = "OBS_DISCORD_LIVE_ADDR";
+
+/// The plugin's TCP port when it listens on TCP without [`ADDR_ENV`].
+pub const DEFAULT_PORT: u16 = 4457;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Addr {
+    Unix(PathBuf),
+    Tcp(String),
+}
+
+impl Addr {
+    pub fn parse(s: &str) -> Addr {
+        let tcp = !s.contains('/') && !s.contains('\\') && s.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok());
+        if tcp { Addr::Tcp(s.into()) } else { Addr::Unix(s.into()) }
+    }
+}
+
+impl std::fmt::Display for Addr {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Addr::Unix(p) => write!(f, "{}", p.display()),
+            Addr::Tcp(a) => write!(f, "tcp {a}"),
+        }
+    }
+}
+
+/// [`ADDR_ENV`] if set; else `$XDG_RUNTIME_DIR/obs-discord-live.sock` on Unix,
+/// and every interface on [`DEFAULT_PORT`] elsewhere.
+pub fn addr() -> Addr {
+    if let Some(v) = std::env::var_os(ADDR_ENV).filter(|v| !v.is_empty()) {
+        return Addr::parse(&v.to_string_lossy());
+    }
+    if cfg!(unix) {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into());
+        Addr::Unix(PathBuf::from(dir).join("obs-discord-live.sock"))
+    } else {
+        Addr::Tcp(format!("0.0.0.0:{DEFAULT_PORT}"))
+    }
+}
+
+/// A connection over either transport.
+pub enum Stream {
+    #[cfg(unix)]
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl Stream {
+    pub fn connect(addr: &Addr) -> io::Result<Stream> {
+        match addr {
+            #[cfg(unix)]
+            Addr::Unix(p) => UnixStream::connect(p).map(Stream::Unix),
+            #[cfg(not(unix))]
+            Addr::Unix(_) => Err(io::Error::new(io::ErrorKind::Unsupported, "Unix sockets need Unix")),
+            Addr::Tcp(a) => Stream::tcp(TcpStream::connect(a.as_str())?),
+        }
+    }
+
+    /// Frames are small and latency matters more than packet count.
+    pub fn tcp(s: TcpStream) -> io::Result<Stream> {
+        s.set_nodelay(true)?;
+        Ok(Stream::Tcp(s))
+    }
+
+    pub fn try_clone(&self) -> io::Result<Stream> {
+        Ok(match self {
+            #[cfg(unix)]
+            Stream::Unix(s) => Stream::Unix(s.try_clone()?),
+            Stream::Tcp(s) => Stream::Tcp(s.try_clone()?),
+        })
+    }
+
+    pub fn shutdown(&self) -> io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Stream::Unix(s) => s.shutdown(Shutdown::Both),
+            Stream::Tcp(s) => s.shutdown(Shutdown::Both),
+        }
+    }
+
+    pub fn set_write_timeout(&self, t: Option<Duration>) -> io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Stream::Unix(s) => s.set_write_timeout(t),
+            Stream::Tcp(s) => s.set_write_timeout(t),
+        }
+    }
+    pub fn set_read_timeout(&self, t: Option<Duration>) -> io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Stream::Unix(s) => s.set_read_timeout(t),
+            Stream::Tcp(s) => s.set_read_timeout(t),
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Stream::Unix(s) => s.read(buf),
+            Stream::Tcp(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Stream::Unix(s) => s.write(buf),
+            Stream::Tcp(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Stream::Unix(s) => s.flush(),
+            Stream::Tcp(s) => s.flush(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +352,15 @@ pub fn write(w: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_addresses() {
+        assert_eq!(Addr::parse("192.168.1.62:4457"), Addr::Tcp("192.168.1.62:4457".into()));
+        assert_eq!(Addr::parse("localhost:4457"), Addr::Tcp("localhost:4457".into()));
+        assert_eq!(Addr::parse("/run/user/1000/odl.sock"), Addr::Unix("/run/user/1000/odl.sock".into()));
+        assert_eq!(Addr::parse("odl.sock"), Addr::Unix("odl.sock".into()));
+        assert_eq!(Addr::parse("/tmp/a:1"), Addr::Unix("/tmp/a:1".into()));
+    }
 
     #[test]
     fn round_trips() {

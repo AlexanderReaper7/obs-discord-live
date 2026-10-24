@@ -50,7 +50,7 @@ pub struct Settings {
 pub const MIN_KBPS: u32 = 100;
 pub const MAX_KBPS: u32 = 50_000;
 
-/// Encoders other than libx264 take a new bitrate only by reopening, which costs
+/// Encoders not in [`LIVE_RATE`] take a new bitrate only by reopening, which costs
 /// a keyframe, so they follow the receiver's estimate at most this often and
 /// only when it moved by more than [`REOPEN_STEP`].
 const REOPEN_INTERVAL: Duration = Duration::from_secs(2);
@@ -64,62 +64,96 @@ pub struct Encoder {
     force_key: bool,
 }
 
-/// The libavcodec encoder and private options for a codec. Every set is
-/// low-delay: no B-frames, no lookahead, a keyframe only on request or every
-/// ten seconds.
-fn choice(codec: Codec) -> (&'static str, Vec<(&'static str, String)>) {
-    match codec {
-        Codec::H264 => (
-            "libx264",
-            vec![
-                ("preset", "veryfast".into()),
-                ("tune", "zerolatency".into()),
-                // WebRTC offers H.264 as 42e01f, constrained baseline level 3.1.
-                // ODL_X264_PROFILE=high trades that for about 10 % less bitrate.
-                ("profile", std::env::var("ODL_X264_PROFILE").unwrap_or("baseline".into())),
-                ("forced-idr", "1".into()),
-                // A scene-cut IDR is a bitrate spike nobody asked for; the
-                // receiver asks with a PLI when it needs one.
-                ("x264-params", "scenecut=0".into()),
-            ],
-        ),
-        Codec::Av1 => (
-            "libsvtav1",
-            vec![
-                ("preset", "10".into()),
-                // Without enable-force-key-frames, SVT-AV1 ignores a frame's
-                // key picture type unless every frame is one (libsvtav1.c).
-                ("svtav1-params", "rtc=1:pred-struct=1:enable-force-key-frames=1".into()),
-            ],
-        ),
-        Codec::Vp8 => (
-            "libvpx",
-            vec![
-                ("deadline", "realtime".into()),
-                ("cpu-used", "8".into()),
-                ("lag-in-frames", "0".into()),
-                // A keyframe may take nine frames' worth of bits, as in libwebrtc.
-                ("max-intra-rate", "900".into()),
-            ],
-        ),
-        Codec::Vp9 => (
-            "libvpx-vp9",
-            vec![
-                ("deadline", "realtime".into()),
-                ("cpu-used", "8".into()),
-                ("lag-in-frames", "0".into()),
-                // A keyframe may take nine frames' worth of bits, as in libwebrtc.
-                ("max-intra-rate", "900".into()),
-                ("row-mt", "1".into()),
-                // Cyclic refresh, libwebrtc's VP9 setting for real-time.
-                ("aq-mode", "3".into()),
-            ],
-        ),
+/// Encoders that take a new bitrate on the next frame, without a reopen.
+const LIVE_RATE: [&str; 2] = ["libx264", "h264_nvenc"];
+
+/// The H.264 encoder. `ODL_H264_ENCODER=h264_nvenc` picks NVENC, never the
+/// default: in the adversary guest on 2026-10-24 each NVENC probe (OBS's
+/// obs-nvenc-test.exe, at OBS start and once by hand) hung the passed-through
+/// 3080 (nvlddmkm event 153), and the second hang killed the running game with
+/// DXGI_ERROR_DEVICE_HUNG.
+fn h264_order() -> Vec<&'static str> {
+    match std::env::var("ODL_H264_ENCODER").as_deref() {
+        Ok("h264_nvenc") => vec!["h264_nvenc"],
+        _ => vec!["libx264"],
     }
 }
 
+/// The private options for each libavcodec encoder. Every set is low-delay: no
+/// B-frames, no lookahead, a keyframe only on request or every ten seconds.
+fn options(name: &str) -> Vec<(&'static str, String)> {
+    match name {
+        "h264_nvenc" => vec![
+            ("preset", "p4".into()),
+            ("tune", "ull".into()),
+            ("profile", std::env::var("ODL_X264_PROFILE").unwrap_or("baseline".into())),
+            ("rc", "cbr".into()),
+            ("zerolatency", "1".into()),
+            ("delay", "0".into()),
+            ("rc-lookahead", "0".into()),
+            ("forced-idr", "1".into()),
+            ("no-scenecut", "1".into()),
+        ],
+        "libx264" => vec![
+            ("preset", "veryfast".into()),
+            ("tune", "zerolatency".into()),
+            // WebRTC offers H.264 as 42e01f, constrained baseline level 3.1.
+            // ODL_X264_PROFILE=high trades that for about 10 % less bitrate.
+            ("profile", std::env::var("ODL_X264_PROFILE").unwrap_or("baseline".into())),
+            ("forced-idr", "1".into()),
+            // A scene-cut IDR is a bitrate spike nobody asked for; the
+            // receiver asks with a PLI when it needs one.
+            ("x264-params", "scenecut=0".into()),
+        ],
+        "libsvtav1" => vec![
+            ("preset", "10".into()),
+            // Without enable-force-key-frames, SVT-AV1 ignores a frame's
+            // key picture type unless every frame is one (libsvtav1.c).
+            ("svtav1-params", "rtc=1:pred-struct=1:enable-force-key-frames=1".into()),
+        ],
+        "libvpx" => vec![
+            ("deadline", "realtime".into()),
+            ("cpu-used", "8".into()),
+            ("lag-in-frames", "0".into()),
+            // A keyframe may take nine frames' worth of bits, as in libwebrtc.
+            ("max-intra-rate", "900".into()),
+        ],
+        "libvpx-vp9" => vec![
+            ("deadline", "realtime".into()),
+            ("cpu-used", "8".into()),
+            ("lag-in-frames", "0".into()),
+            ("max-intra-rate", "900".into()),
+            ("row-mt", "1".into()),
+            // Cyclic refresh, libwebrtc's VP9 setting for real-time.
+            ("aq-mode", "3".into()),
+        ],
+        _ => vec![],
+    }
+}
+
+fn candidates(codec: Codec) -> Vec<&'static str> {
+    match codec {
+        Codec::H264 => h264_order(),
+        Codec::Av1 => vec!["libsvtav1"],
+        Codec::Vp8 => vec!["libvpx"],
+        Codec::Vp9 => vec!["libvpx-vp9"],
+    }
+}
+
+/// Opens the first of the codec's encoders that opens.
 fn open(s: &Settings) -> Result<(ff::encoder::Video, &'static str), String> {
-    let (name, options) = choice(s.codec);
+    let mut errors = Vec::new();
+    for name in candidates(s.codec) {
+        match open_one(name, s) {
+            Ok(enc) => return Ok((enc, name)),
+            Err(e) => errors.push(e),
+        }
+    }
+    Err(errors.join("; "))
+}
+
+fn open_one(name: &'static str, s: &Settings) -> Result<ff::encoder::Video, String> {
+    let options = options(name);
     let codec =
         ff::encoder::find_by_name(name).ok_or_else(|| format!("libavcodec has no {name}"))?;
     let mut ctx = ff::codec::context::Context::new_with_codec(codec)
@@ -144,8 +178,7 @@ fn open(s: &Settings) -> Result<(ff::encoder::Video, &'static str), String> {
     for (k, v) in &options {
         dict.set(k, v);
     }
-    let enc = ctx.open_with(dict).map_err(|e| format!("{name}: {e}"))?;
-    Ok((enc, name))
+    ctx.open_with(dict).map_err(|e| format!("{name}: {e}"))
 }
 
 /// Constant bitrate with a half-second buffer, so a frame never overshoots what
@@ -172,14 +205,14 @@ impl Encoder {
         self.force_key = true;
     }
 
-    /// Follows `kbps` if the encoder can; libx264 reconfigures on the next frame.
+    /// Follows `kbps` if the encoder can; libx264 and NVENC reconfigure on the next frame.
     pub fn follow_bitrate(&mut self, kbps: u32) {
         let kbps = kbps.clamp(MIN_KBPS, MAX_KBPS);
         let old = self.settings.bitrate_kbps;
         if kbps == old {
             return;
         }
-        if self.name == "libx264" {
+        if LIVE_RATE.contains(&self.name) {
             set_rate(&mut self.enc, kbps);
             self.settings.bitrate_kbps = kbps;
             return;

@@ -1,22 +1,24 @@
-//! The Unix socket the client connects to, and the state the OBS side shares with it.
+//! The socket the client connects to (`odl_proto::addr`), and the state the OBS side shares with it.
 
 use std::io;
+use std::net::TcpListener;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use odl_proto::{ClientMsg, ServerMsg};
+use odl_proto::{Addr, ClientMsg, ServerMsg, Stream};
 
 use crate::encoder::Codec;
 use crate::output::{self, Action};
 
 pub struct Client {
     id: u64,
-    stream: UnixStream,
+    stream: Stream,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -43,7 +45,7 @@ impl Shared {
         let Some(client) = guard.as_mut() else { return };
         if let Err(e) = odl_proto::write(&mut client.stream, &msg.encode()) {
             crate::warn(&format!("client {}: write: {e}; dropping it", client.id));
-            let _ = client.stream.shutdown(std::net::Shutdown::Both);
+            let _ = client.stream.shutdown();
             *guard = None;
             drop(guard);
             output::queue(Action::Stop);
@@ -51,27 +53,76 @@ impl Shared {
     }
 }
 
+enum Listener {
+    #[cfg(unix)]
+    Unix(UnixListener),
+    Tcp(TcpListener),
+}
+
+impl Listener {
+    fn bind(addr: &Addr) -> io::Result<Listener> {
+        match addr {
+            #[cfg(unix)]
+            Addr::Unix(path) => {
+                match std::fs::remove_file(path) {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                    _ => {}
+                }
+                let l = UnixListener::bind(path)?;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+                Ok(Listener::Unix(l))
+            }
+            #[cfg(not(unix))]
+            Addr::Unix(_) => Err(io::Error::new(io::ErrorKind::Unsupported, "Unix sockets need Unix")),
+            Addr::Tcp(a) => TcpListener::bind(a.as_str()).map(Listener::Tcp),
+        }
+    }
+
+    fn accept(&self) -> io::Result<Stream> {
+        match self {
+            #[cfg(unix)]
+            Listener::Unix(l) => l.accept().map(|(s, _)| Stream::Unix(s)),
+            Listener::Tcp(l) => {
+                let (s, peer) = l.accept()?;
+                crate::info(&format!("connection from {peer}"));
+                Stream::tcp(s)
+            }
+        }
+    }
+
+    /// Where a connection reaches this listener, to wake `accept` at shutdown.
+    fn wake_addr(&self, addr: &Addr) -> Addr {
+        match self {
+            #[cfg(unix)]
+            Listener::Unix(_) => addr.clone(),
+            Listener::Tcp(l) => match l.local_addr() {
+                Ok(a) if a.ip().is_unspecified() => Addr::Tcp(format!("127.0.0.1:{}", a.port())),
+                Ok(a) => Addr::Tcp(a.to_string()),
+                Err(_) => addr.clone(),
+            },
+        }
+    }
+}
+
 pub struct Server {
-    path: PathBuf,
+    addr: Addr,
+    wake: Addr,
     accept: Option<JoinHandle<()>>,
     readers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 pub fn spawn(shared: Arc<Shared>) -> io::Result<Server> {
-    let path = odl_proto::socket_path();
-    match std::fs::remove_file(&path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-        _ => {}
-    }
-    let listener = UnixListener::bind(&path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    crate::info(&format!("listening on {}", path.display()));
+    let addr = odl_proto::addr();
+    let listener = Listener::bind(&addr).map_err(|e| io::Error::new(e.kind(), format!("{addr}: {e}")))?;
+    let wake = listener.wake_addr(&addr);
+    crate::info(&format!("listening on {addr}"));
     let readers: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
     let r = readers.clone();
     let accept = std::thread::Builder::new()
         .name("odl-accept".into())
         .spawn(move || {
-            for stream in listener.incoming() {
+            loop {
+                let stream = listener.accept();
                 if shared.quit.load(Ordering::SeqCst) {
                     break;
                 }
@@ -87,10 +138,10 @@ pub fn spawn(shared: Arc<Shared>) -> io::Result<Server> {
                 }
             }
         })?;
-    Ok(Server { path, accept: Some(accept), readers })
+    Ok(Server { addr, wake, accept: Some(accept), readers })
 }
 
-fn connect(shared: &Arc<Shared>, stream: UnixStream) -> Option<JoinHandle<()>> {
+fn connect(shared: &Arc<Shared>, stream: Stream) -> Option<JoinHandle<()>> {
     let id = shared.next_id.fetch_add(1, Ordering::SeqCst) + 1;
     let writer = match stream.try_clone() {
         Ok(w) => w,
@@ -102,7 +153,7 @@ fn connect(shared: &Arc<Shared>, stream: UnixStream) -> Option<JoinHandle<()>> {
     let _ = writer.set_write_timeout(Some(Duration::from_secs(2)));
     if let Some(old) = shared.client.lock().unwrap().replace(Client { id, stream: writer }) {
         crate::info(&format!("client {id} replaces client {}", old.id));
-        let _ = old.stream.shutdown(std::net::Shutdown::Both);
+        let _ = old.stream.shutdown();
     } else {
         crate::info(&format!("client {id} connected"));
     }
@@ -117,7 +168,7 @@ fn is_current(shared: &Shared, id: u64) -> bool {
     shared.client.lock().unwrap().as_ref().is_some_and(|c| c.id == id)
 }
 
-fn read_loop(shared: &Shared, id: u64, mut stream: UnixStream) {
+fn read_loop(shared: &Shared, id: u64, mut stream: Stream) {
     loop {
         let msg = match odl_proto::read_client(&mut stream) {
             Ok(Some(m)) => m,
@@ -163,16 +214,18 @@ impl Server {
     pub fn shutdown(&mut self, shared: &Shared) {
         shared.quit.store(true, Ordering::SeqCst);
         if let Some(c) = shared.client.lock().unwrap().take() {
-            let _ = c.stream.shutdown(std::net::Shutdown::Both);
+            let _ = c.stream.shutdown();
         }
         // Wakes accept() so the loop sees `quit`.
-        let _ = UnixStream::connect(&self.path);
+        let _ = Stream::connect(&self.wake);
         if let Some(h) = self.accept.take() {
             let _ = h.join();
         }
         for h in self.readers.lock().unwrap().drain(..) {
             let _ = h.join();
         }
-        let _ = std::fs::remove_file(&self.path);
+        if let Addr::Unix(path) = &self.addr {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
