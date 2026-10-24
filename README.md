@@ -33,6 +33,8 @@ MaxRGB SDR is BT.2390's EETF: linear below a knee, then a roll-off that ends at 
 | Reinhard, white level 300 | 46 | 80 | 113 | 143 | 174 | 210 | 229 |
 | MaxRGB SDR, 1000 to 150 | 62 | 110 | 161 | 206 | 236 | 253 | 255 |
 
+In Warframe with `Graphics.HDROutput=1` and `HDRPaperWhiteNits=254`, the HUD's white text came out at 237 to 243, where the table puts 254 nits at about 240. 0.7 % of a mission frame reached 254 or 255, all of it specular highlights on armour.
+
 ## Encoders
 
 Picked by the codec the client names, which is the one Discord negotiated. Discord negotiates H264, so in practice it is the H264 row:
@@ -144,3 +146,5 @@ VP8 does not get down to 800 kbps on this content because its coarsest quantizer
 2026-10-25, the settings window in OBS 32.2.2 on strix. A hand-written `settings.json` (profile high, keyframes every 2 s, 1500 kbps cap) gave a High profile stream with keyframes at frames 0, 60 and 120. A 300 kbps cap gave 207 kbps where the uncapped stream ran at 880, and a listen address of `127.0.0.1:14999` moved the socket to TCP. Tools → Discord Go Live opened the window with those values and the status lines; Defaults and OK wrote `{}` to the file, moved the socket back to `$XDG_RUNTIME_DIR` without an OBS restart, and the next stream was constrained baseline.
 
 2026-10-25, a Go Live from OBS 33.0.0 in the adversary guest, Vesktop on strix connected to `192.168.1.62:4457`, started by the user with the OBS card. The guest log at 00:23:02 shows the client, H264 at 1000 kbps, then libx264 1280x720 30 fps. Over CDP the video sender was connected at 29.8 fps, 1280x720, encoder OpenH264, its track a `MediaStreamTrackGenerator`, and sent about 3.6 Mbps against a `targetBitrate` of 3500000. Black frames from OpenH264 come to a few kbps, so those bytes are the plugin's frames. The decoded preview showed the guest's OBS window once playing. The maxFramerate check in `pollStats` was added after this run and has not run in a live Go Live.
+
+2026-10-25, the guest Go Live while Warframe ran a mission in HDR (`Graphics.HDROutput=1`, paper white 254 nits), canvas 3840x2160 scaled to 1280x720 at 30 fps, the HDR to SDR filter on. obs-websocket `GetStats`: 1.15 ms average render time, OBS's CPU use 3.1 to 5.7 % with libx264 encoding in the process, 0 of 30650 output frames skipped, 130 of 36768 render frames skipped. A `GetSourceScreenshot` of the Display source, filter applied, gave the HUD and highlight values in the HDR to SDR section.
