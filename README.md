@@ -2,7 +2,7 @@
 
 Streams OBS's program view into a Discord Go Live without Discord encoding it a second time. Two parts:
 
-- `plugin/` is an OBS output in Rust. It takes raw I420 frames at the canvas's output size and rate, encodes them through OBS's own libavcodec, and serves them on `$XDG_RUNTIME_DIR/obs-discord-live.sock`. The client can ask for a keyframe (a PLI from a viewer) and set the bitrate (the sender's bandwidth estimate). The output has no button; it runs while a client holds a session.
+- `plugin/` is an OBS output in Rust, for Linux and Windows. It takes raw I420 frames at the canvas's output size and rate, encodes them through OBS's own libavcodec, and serves them on `$XDG_RUNTIME_DIR/obs-discord-live.sock` on Linux and TCP port 4457 on Windows. `OBS_DISCORD_LIVE_ADDR` overrides either: `HOST:PORT` is TCP, anything else a socket path. The client can ask for a keyframe (a PLI from a viewer) and set the bitrate (the sender's bandwidth estimate). The output has no button; it runs while a client holds a session.
 - `vesktop/obs-discord-live.patch`, against Vesktop 1.6.7, adds OBS as a Go Live source. It puts the plugin's frames into the Go Live sender ahead of Discord's encryption, and forwards keyframe requests and `targetBitrate` back. Design below.
 
 `proto/` is the wire format, documented in `proto/src/lib.rs`. `client/` is a test client that stands in for Vesktop.
@@ -11,9 +11,20 @@ Streams OBS's program view into a Discord Go Live without Discord encoding it a 
 
 libobs 32.2 has no call that asks an encoder for a keyframe, and its WHIP output ignores PLIs. A viewer who joins late or loses a packet would wait for the next periodic keyframe. Owning the encoder makes a keyframe request take effect on the next frame.
 
+## Where OBS runs
+
+Decided 2026-10-24: OBS runs in the `adversary` guest (stealth-vm), and Vesktop on the host connects to the plugin over `svmbr0`, `192.168.1.62:4457`. A Windows firewall rule lets only the host, `192.168.1.1`, in.
+
+The first version ran OBS on the host with Looking Glass as the source. That path cost picture quality in two places:
+
+- Looking Glass B7's D12 backend sends an HDR desktop as 10-bit UNORM of linear light (`HDR16to10`), scaled so SDR white is 1.0. Linear light in 10 bits has too few steps in the dark, which showed as grain, and everything above SDR white clips.
+- The fix there is 16-bit float frames. A 3840x2160 RGBA16F frame is 66 MB, over the 62 MiB frame limit of the 128 MiB kvmfr device; 256 MiB needs a VM restart.
+
+In the guest, OBS captures the display itself as 16-bit float and tonemaps HDR to SDR in its own shaders, at the full 3840x2160, then scales to the 1280x720 output with the area filter. Looking Glass stays the user's view of the guest and is no longer in the stream.
+
 ## Encoders
 
-Picked by the codec the client names, which is the one Discord negotiated:
+Picked by the codec the client names, which is the one Discord negotiated. Discord negotiates H264, so in practice it is the H264 row:
 
 | Codec | Encoder | Bitrate change |
 | --- | --- | --- |
@@ -22,7 +33,10 @@ Picked by the codec the client names, which is the one Discord negotiated:
 | VP8 | libvpx realtime, CBR | reopen, same limits |
 | VP9 | libvpx-vp9 realtime, CBR, cyclic refresh | reopen, same limits |
 
-`ODL_X264_PROFILE=high` in OBS's environment trades the baseline profile for about 10 % less bitrate, if the receivers accept it.
+There is no settings UI. Two variables in OBS's environment change the H.264 encoder:
+
+- `ODL_X264_PROFILE=high` trades the baseline profile for about 10 % less bitrate, if the receivers accept it.
+- `ODL_H264_ENCODER=h264_nvenc` encodes on NVENC instead of libx264 (CBR, `p4`, `ull`, live bitrate changes). It is off by default: in the guest on 2026-10-24, each NVENC probe hung the passed-through RTX 3080 (`nvlddmkm` event 153), and the second hang ended the running game with `DXGI_ERROR_DEVICE_HUNG`. OBS's own NVENC module is moved out of the guest's install for the same reason.
 
 ## What Discord's Go Live sender is
 
@@ -47,12 +61,12 @@ Decided 2026-10-24 from the measurements above and `phase0/loopback.js`.
 - **Feedback.** A keyframe from OpenH264 after the first (it makes one on a PLI) and a rising `pliCount` or `firCount` become `KeyframeRequest`. `targetBitrate` from the sender's stats becomes `SetBitrate` when it moves more than 5 %, polled every second.
 - **The encoding's frame rate cap is raised to 60.** At Discord's 30, Chromium dropped about one generated frame a minute that arrived early; at 60 it dropped none in a minute. Each drop costs a keyframe.
 - **The local preview decodes the plugin's frames.** Discord's preview plays the sender's track, which is black. A `VideoDecoder` feeds a second generator track, and a `<video>` handed the Go Live track gets that one; the `srcObject` getter still returns what Discord set.
-- **The plugin socket stays in Vesktop's main process**, which can open Unix sockets; access units reach the page over IPC.
+- **The plugin socket stays in Vesktop's main process**, which can open Unix and TCP sockets; access units reach the page over IPC. With `OBS_DISCORD_LIVE_ADDR=HOST:PORT` it connects over TCP. The picker shows the OBS card when a connect to that address succeeds within 500 ms. The plugin takes the newest connection as its client, so that probe ends a running OBS session; opening the picker during one means a new Go Live anyway.
 - **WebRTC uses only the default-route interface.** strix gathers 34 local candidates (Docker bridges, `svmbr0`, Tailscale, Mullvad), all leaving through one public IP on different ports. One Go Live attempt nominated the Docker bridge `172.23.0.1` and never finished DTLS: 22 packets out, 0 bytes back. `--force-webrtc-ip-handling-policy` had no effect in Electron 43, so the patch calls `webContents.setWebRTCIPHandlingPolicy("default_public_interface_only")` on the main window. That applies to voice calls too.
 
 ## Install with nix
 
-The flake has `packages.x86_64-linux.default`, the plugin, and `packages.x86_64-linux.vesktop`, nixpkgs's Vesktop with the patch. For a NixOS config, `lib.plugin { pkgs; cpuArch = "znver5"; }` builds the plugin for a CPU, and `lib.vesktop { pkgs; }` the patched Vesktop:
+The flake has `packages.x86_64-linux.default`, the plugin, `packages.x86_64-linux.vesktop`, nixpkgs's Vesktop with the patch, and `packages.x86_64-linux.windows`, the plugin as a DLL for OBS 33.0.0 on Windows x64. For a NixOS config, `lib.plugin { pkgs; cpuArch = "znver5"; }` builds the plugin for a CPU, and `lib.vesktop { pkgs; }` the patched Vesktop:
 
 ```nix
 programs.obs-studio.plugins = [ (inputs.obs-discord-live.lib.plugin { inherit pkgs; cpuArch = config.mine.cpu.arch; }) ];
@@ -60,6 +74,12 @@ environment.systemPackages = [ (inputs.obs-discord-live.lib.vesktop { inherit pk
 ```
 
 The patch is the one commit on top of Vesktop 1.6.7's source; it changes no dependency, so nixpkgs's pnpm hash still holds.
+
+## Install in a Windows guest
+
+`nix build .#windows` cross-builds with mingw. It links `obs.dll` and `obs-frontend-api.dll` from the OBS 33.0.0 release and FFmpeg from the obs-deps build that release pins, so the DLL needs nothing OBS does not ship. A different OBS version needs those three inputs changed in `flake.nix`.
+
+Copy `obs-plugins/obs-discord-live/bin/64bit/obs-discord-live.dll` from the result to `C:\ProgramData\obs-studio\plugins\obs-discord-live\bin\64bit\` in the guest, allow TCP 4457 from the host only, and start Vesktop with `OBS_DISCORD_LIVE_ADDR=<guest>:4457`.
 
 ## Build and install for development
 
