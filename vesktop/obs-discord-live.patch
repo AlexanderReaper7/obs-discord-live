@@ -1,0 +1,845 @@
+From a9d94ae36509280b923fc518b01f70ff955b2e7a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Alexander=20=C3=96berg?=
+ <24926972+AlexanderReaper7@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 23:17:00 +0200
+Subject: [PATCH] obs-discord-live: OBS as a Go Live source
+
+---
+ src/main/mainWindow.ts                        |   4 +
+ src/main/obsDiscordLive.ts                    | 143 +++++++
+ src/main/screenShare.ts                       |  32 +-
+ src/preload/VesktopNative.ts                  |  10 +
+ src/renderer/components/ScreenSharePicker.tsx |  62 +--
+ src/renderer/obsDiscordLive.ts                | 397 ++++++++++++++++++
+ src/renderer/patches/screenShareFixes.ts      |  26 +-
+ src/shared/IpcEvents.ts                       |   8 +-
+ 8 files changed, 644 insertions(+), 38 deletions(-)
+ create mode 100644 src/main/obsDiscordLive.ts
+ create mode 100644 src/renderer/obsDiscordLive.ts
+
+diff --git a/src/main/mainWindow.ts b/src/main/mainWindow.ts
+index daf0c0c..fea9f9f 100644
+--- a/src/main/mainWindow.ts
++++ b/src/main/mainWindow.ts
+@@ -386,6 +386,10 @@ function createMainWindow() {
+     removeVencordSettingsListeners();
+ 
+     const win = (mainWin = new BrowserWindow(buildBrowserWindowOptions()));
++    // Gather ICE candidates only on the default-route interface. A machine with
++    // Docker bridges, VPNs or VM bridges otherwise offers dozens of candidates,
++    // and a nominated bridge address left a Go Live without DTLS (2026-10-24).
++    win.webContents.setWebRTCIPHandlingPolicy("default_public_interface_only");
+ 
+     win.setMenuBarVisibility(false);
+     if (process.platform === "darwin" && Settings.store.customTitleBar) win.setWindowButtonVisibility(false);
+diff --git a/src/main/obsDiscordLive.ts b/src/main/obsDiscordLive.ts
+new file mode 100644
+index 0000000..8ebbbf8
+--- /dev/null
++++ b/src/main/obsDiscordLive.ts
+@@ -0,0 +1,143 @@
++/*
++ * Vesktop, a desktop app aiming to give you a snappier Discord Experience
++ * Copyright (c) 2026 Vendicated and Vencord contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++// Client for the obs-discord-live OBS plugin. The plugin encodes OBS's program
++// view and serves access units on a Unix socket; this side relays them to the
++// renderer, which puts them into the Go Live sender. Wire format: every message
++// is a u32 LE length of what follows, one type byte, then the payload; strings
++// are a u8 length and UTF-8. See proto/src/lib.rs in obs-discord-live.
++
++import { existsSync } from "fs";
++import { connect, Socket } from "net";
++import { join } from "path";
++import { IpcEvents } from "shared/IpcEvents";
++
++import { mainWin } from "./mainWindow";
++import { handle } from "./utils/ipcWrappers";
++
++export const OBS_SOURCE_ID = "odl:obs";
++
++const C_START = 0x01;
++const C_KEYFRAME = 0x02;
++const C_BITRATE = 0x03;
++const C_STOP = 0x04;
++const S_CONFIG = 0x81;
++const S_FRAME = 0x82;
++const S_ERROR = 0x83;
++const MAX_MESSAGE = 16 << 20;
++
++export type OdlEvent =
++    | { type: "config"; codec: string; encoder: string; width: number; height: number; fpsNum: number; fpsDen: number }
++    | { type: "frame"; ptsUs: number; key: boolean; data: Uint8Array }
++    | { type: "error"; message: string }
++    | { type: "closed" };
++
++export function socketPath() {
++    return join(process.env.XDG_RUNTIME_DIR || "/tmp", "obs-discord-live.sock");
++}
++
++/** The plugin listens only while OBS runs with it loaded. */
++export function obsAvailable() {
++    return process.platform === "linux" && existsSync(socketPath());
++}
++
++let sock: Socket | null = null;
++
++function message(kind: number, payload: Buffer = Buffer.alloc(0)) {
++    const head = Buffer.alloc(5);
++    head.writeUInt32LE(payload.length + 1, 0);
++    head[4] = kind;
++    return Buffer.concat([head, payload]);
++}
++
++function u32(v: number) {
++    const b = Buffer.alloc(4);
++    b.writeUInt32LE(Math.max(0, Math.round(v)) >>> 0, 0);
++    return b;
++}
++
++function str(s: string) {
++    const b = Buffer.from(s, "utf8").subarray(0, 255);
++    return Buffer.concat([Buffer.from([b.length]), b]);
++}
++
++function emit(e: OdlEvent) {
++    if (!mainWin.isDestroyed()) mainWin.webContents.send(IpcEvents.ODL_EVENT, e);
++}
++
++function decode(kind: number, body: Buffer): OdlEvent | null {
++    let at = 0;
++    const s = () => {
++        const n = body[at];
++        const v = body.toString("utf8", at + 1, at + 1 + n);
++        at += 1 + n;
++        return v;
++    };
++    const n = () => {
++        const v = body.readUInt32LE(at);
++        at += 4;
++        return v;
++    };
++    switch (kind) {
++        case S_CONFIG:
++            return { type: "config", codec: s(), encoder: s(), width: n(), height: n(), fpsNum: n(), fpsDen: n() };
++        case S_FRAME:
++            return {
++                type: "frame",
++                ptsUs: Number(body.readBigUInt64LE(0)),
++                key: body[8] !== 0,
++                // A copy, so IPC does not serialize the whole socket buffer behind the view.
++                data: new Uint8Array(body.subarray(9))
++            };
++        case S_ERROR:
++            return { type: "error", message: s() };
++        default:
++            return null;
++    }
++}
++
++function start(codec: string, kbps: number) {
++    stop();
++    const s = connect(socketPath());
++    sock = s;
++    let buf: Buffer = Buffer.alloc(0);
++    s.on("data", (chunk: Buffer) => {
++        buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
++        while (buf.length >= 4) {
++            const len = buf.readUInt32LE(0);
++            if (len === 0 || len > MAX_MESSAGE) {
++                emit({ type: "error", message: `message length ${len} out of range` });
++                s.destroy();
++                return;
++            }
++            if (buf.length < 4 + len) break;
++            const e = decode(buf[4], buf.subarray(5, 4 + len));
++            buf = buf.subarray(4 + len);
++            if (e) emit(e);
++        }
++    });
++    s.on("error", err => {
++        if (sock === s) emit({ type: "error", message: err.message });
++    });
++    s.on("close", () => {
++        if (sock !== s) return;
++        sock = null;
++        emit({ type: "closed" });
++    });
++    s.write(message(C_START, Buffer.concat([str(codec), u32(kbps)])));
++}
++
++function stop() {
++    const s = sock;
++    if (!s) return;
++    sock = null;
++    s.end(message(C_STOP));
++}
++
++handle(IpcEvents.ODL_START, (_, codec: string, kbps: number) => start(codec, kbps));
++handle(IpcEvents.ODL_KEYFRAME, () => sock?.write(message(C_KEYFRAME)));
++handle(IpcEvents.ODL_SET_BITRATE, (_, kbps: number) => sock?.write(message(C_BITRATE, u32(kbps))));
++handle(IpcEvents.ODL_STOP, () => stop());
+diff --git a/src/main/screenShare.ts b/src/main/screenShare.ts
+index a96b1ce..cf69bf2 100644
+--- a/src/main/screenShare.ts
++++ b/src/main/screenShare.ts
+@@ -9,8 +9,20 @@ import type { StreamPick } from "renderer/components/ScreenSharePicker";
+ import { IpcCommands, IpcEvents } from "shared/IpcEvents";
+ 
+ import { sendRendererCommand } from "./ipcCommands";
++import { OBS_SOURCE_ID, obsAvailable } from "./obsDiscordLive";
+ import { handle } from "./utils/ipcWrappers";
+ 
++const PORTAL_SOURCE_ID = "odl:portal";
++
++// The picker grid shows a thumbnail at its natural size, 176 wide like the
++// desktopCapturer thumbnails below.
++function svgCard(text: string) {
++    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="176" height="99"><rect width="100%" height="100%" fill="#000"/><text x="50%" y="50%" fill="#fff" font-family="sans-serif" font-size="28" text-anchor="middle" dominant-baseline="middle">${text}</text></svg>`;
++    return "data:image/svg+xml;base64," + Buffer.from(svg).toString("base64");
++}
++
++const obsSource = () => ({ id: OBS_SOURCE_ID, name: "OBS program view", url: svgCard("OBS") });
++
+ const isWayland =
+     process.platform === "linux" && (process.env.XDG_SESSION_TYPE === "wayland" || !!process.env.WAYLAND_DISPLAY);
+ 
+@@ -27,6 +39,23 @@ export function registerScreenShareHandler() {
+     });
+ 
+     session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
++        // With the obs-discord-live plugin listening, OBS is a source. Picking it
++        // captures Vesktop's own frame, which needs no portal; the renderer
++        // replaces that track with one that carries OBS's encoded frames.
++        if (isWayland && obsAvailable()) {
++            const choice = await sendRendererCommand<StreamPick>(IpcCommands.SCREEN_SHARE_PICKER, {
++                screens: [obsSource(), { id: PORTAL_SOURCE_ID, name: "Screen or window", url: svgCard("Portal") }],
++                skipPicker: false
++            }).catch(() => null);
++            if (!choice) return callback({});
++            if (choice.id === OBS_SOURCE_ID) return callback(request.frame ? { video: request.frame } : {});
++
++            const sources = await desktopCapturer
++                .getSources({ types: ["window", "screen"], thumbnailSize: { width: 0, height: 0 } })
++                .catch(err => console.error("Error during screenshare picker", err));
++            return callback(sources?.[0] ? { video: sources[0] } : {});
++        }
++
+         // request full resolution on wayland right away because we always only end up with one result anyway
+         const width = isWayland ? 1920 : 176;
+         const sources = await desktopCapturer
+@@ -63,7 +92,7 @@ export function registerScreenShareHandler() {
+         }
+ 
+         const choice = await sendRendererCommand<StreamPick>(IpcCommands.SCREEN_SHARE_PICKER, {
+-            screens: data,
++            screens: obsAvailable() ? [obsSource(), ...data] : data,
+             skipPicker: false
+         }).catch(e => {
+             console.error("Error during screenshare picker", e);
+@@ -71,6 +100,7 @@ export function registerScreenShareHandler() {
+         });
+ 
+         if (!choice) return callback({});
++        if (choice.id === OBS_SOURCE_ID) return callback(request.frame ? { video: request.frame } : {});
+ 
+         const source = sources.find(s => s.id === choice.id);
+         if (!source) return callback({});
+diff --git a/src/preload/VesktopNative.ts b/src/preload/VesktopNative.ts
+index e11fae7..f767fd2 100644
+--- a/src/preload/VesktopNative.ts
++++ b/src/preload/VesktopNative.ts
+@@ -7,6 +7,7 @@
+ import type { Node } from "@vencord/venmic";
+ import { ipcRenderer } from "electron/renderer";
+ import type { IpcMessage, IpcResponse } from "main/ipcCommands";
++import type { OdlEvent } from "main/obsDiscordLive";
+ import type { Settings } from "shared/settings";
+ 
+ import { IpcEvents } from "../shared/IpcEvents";
+@@ -94,6 +95,15 @@ export const VesktopNative = {
+         startSystem: (exclude: Node[]) => invoke<void>(IpcEvents.VIRT_MIC_START_SYSTEM, exclude),
+         stop: () => invoke<void>(IpcEvents.VIRT_MIC_STOP)
+     },
++    obsLive: {
++        start: (codec: string, kbps: number) => invoke<void>(IpcEvents.ODL_START, codec, kbps),
++        keyframe: () => invoke<void>(IpcEvents.ODL_KEYFRAME),
++        setBitrate: (kbps: number) => invoke<void>(IpcEvents.ODL_SET_BITRATE, kbps),
++        stop: () => invoke<void>(IpcEvents.ODL_STOP),
++        onEvent: (cb: (e: OdlEvent) => void) => {
++            ipcRenderer.on(IpcEvents.ODL_EVENT, (_, e: OdlEvent) => cb(e));
++        }
++    },
+     clipboard: {
+         copyImage: (imageBuffer: Uint8Array, imageSrc: string) =>
+             invoke<void>(IpcEvents.CLIPBOARD_COPY_IMAGE, imageBuffer, imageSrc)
+diff --git a/src/renderer/components/ScreenSharePicker.tsx b/src/renderer/components/ScreenSharePicker.tsx
+index 9f367bd..7c270ea 100644
+--- a/src/renderer/components/ScreenSharePicker.tsx
++++ b/src/renderer/components/ScreenSharePicker.tsx
+@@ -62,6 +62,8 @@ interface StreamSettings {
+     contentHint?: string;
+     includeSources?: AudioSources;
+     excludeSources?: AudioSources;
++    /** The OBS source of the obs-discord-live plugin, see renderer/obsDiscordLive. */
++    obs?: boolean;
+ }
+ 
+ export interface StreamPick extends StreamSettings {
+@@ -347,7 +349,10 @@ function StreamSettingsUi({
+     const qualitySettings = State.store.screenshareQuality!;
+ 
+     const [thumb] = useAwaiter(
+-        () => (skipPicker ? Promise.resolve(source.url) : VesktopNative.capturer.getLargeThumbnail(source.id)),
++        () =>
++            skipPicker || source.id.startsWith("odl:")
++                ? Promise.resolve(source.url)
++                : VesktopNative.capturer.getLargeThumbnail(source.id),
+         {
+             fallbackValue: source.url,
+             deps: [source.id]
+@@ -716,7 +721,7 @@ function ModalComponent({
+     });
+ 
+     function handleGoLive() {
+-        currentSettings = settings;
++        currentSettings = { ...settings, obs: selected === "odl:obs" };
+         try {
+             const frameRate = Number(qualitySettings.frameRate);
+             const height = Number(qualitySettings.resolution);
+@@ -738,32 +743,33 @@ function ModalComponent({
+                 ...settings
+             });
+ 
+-            setTimeout(async () => {
+-                const conn = [...MediaEngineStore.getMediaEngine().connections].find(
+-                    connection => connection.streamUserId === UserStore.getCurrentUser().id
+-                );
+-                if (!conn) return;
+-
+-                // @ts-expect-error incorrect type
+-                const track = conn.input.stream.getVideoTracks()[0];
+-
+-                const constraints = {
+-                    ...track.getConstraints(),
+-                    frameRate: { min: frameRate, ideal: frameRate },
+-                    width: { min: 640, ideal: width, max: width },
+-                    height: { min: 480, ideal: height, max: height },
+-                    advanced: [{ width: width, height: height }],
+-                    resizeMode: "none"
+-                };
+-
+-                try {
+-                    await track.applyConstraints(constraints);
+-
+-                    logger.info("Applied constraints successfully. New constraints:", track.getConstraints());
+-                } catch (e) {
+-                    logger.error("Failed to apply constraints.", e);
+-                }
+-            }, 100);
++            if (!currentSettings.obs)
++                setTimeout(async () => {
++                    const conn = [...MediaEngineStore.getMediaEngine().connections].find(
++                        connection => connection.streamUserId === UserStore.getCurrentUser().id
++                    );
++                    if (!conn) return;
++
++                    // @ts-expect-error incorrect type
++                    const track = conn.input.stream.getVideoTracks()[0];
++
++                    const constraints = {
++                        ...track.getConstraints(),
++                        frameRate: { min: frameRate, ideal: frameRate },
++                        width: { min: 640, ideal: width, max: width },
++                        height: { min: 480, ideal: height, max: height },
++                        advanced: [{ width: width, height: height }],
++                        resizeMode: "none"
++                    };
++
++                    try {
++                        await track.applyConstraints(constraints);
++
++                        logger.info("Applied constraints successfully. New constraints:", track.getConstraints());
++                    } catch (e) {
++                        logger.error("Failed to apply constraints.", e);
++                    }
++                }, 100);
+         } catch (error) {
+             logger.error("Error while submitting stream.", error);
+         }
+diff --git a/src/renderer/obsDiscordLive.ts b/src/renderer/obsDiscordLive.ts
+new file mode 100644
+index 0000000..c4dcf80
+--- /dev/null
++++ b/src/renderer/obsDiscordLive.ts
+@@ -0,0 +1,397 @@
++/*
++ * Vesktop, a desktop app aiming to give you a snappier Discord Experience
++ * Copyright (c) 2026 Vendicated and Vencord contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++// Puts the frames that the obs-discord-live OBS plugin encodes into the Go Live
++// sender, so Discord sends OBS's encode instead of encoding a capture itself.
++//
++// Discord gives every sender an RTCRtpScriptTransform into its encryption
++// worker. For a video sender while an OBS session runs, the patch takes the
++// sender's encoded frames with createEncodedStreams() instead, swaps each
++// frame's payload for the plugin's next access unit, and posts the streams to
++// the same worker in the message Discord's worker already accepts for a
++// transform. Encryption, packetization and congestion control stay Discord's.
++//
++// The Go Live track is a MediaStreamTrackGenerator that gets one black frame per
++// plugin frame, so Chromium encodes one frame for each access unit. The swap
++// pairs them in order: an encoded frame's RTP timestamp follows the wall clock
++// of the write, not the VideoFrame timestamp, so order is the only reliable key.
++//
++// Discord's own preview plays the sender's track, which is black. The patch
++// decodes the plugin's frames into a second track and gives that to any video
++// element that is handed the Go Live track.
++
++import { Logger } from "@vencord/types/utils";
++
++import type { OdlEvent } from "../main/obsDiscordLive";
++
++const logger = new Logger("ObsDiscordLive");
++
++/** The ENCRYPT operation and RTC_TRANSFORM message type of Discord's encryption worker. */
++const ENCRYPT = 0;
++const RTC_TRANSFORM = 1;
++
++const START_KBPS = 1000;
++/** A queue longer than this means Chromium dropped frames; a keyframe resyncs. */
++const MAX_BACKLOG = 2;
++/** Frames queued before any sender takes them are dropped beyond this. */
++const MAX_QUEUE = 30;
++const KEYFRAME_INTERVAL_MS = 300;
++/**
++ * The encoding's frame rate cap. At Discord's 30, Chromium dropped about one
++ * generated frame a minute that arrived early at a 30 fps plugin; at 60 it
++ * dropped none in a minute (2026-10-24). Each drop costs a keyframe.
++ */
++const MAX_FRAMERATE = 60;
++
++/** WebCodecs names for what the plugin's encoders produce. */
++const DECODER_CODECS: Record<string, string> = {
++    H264: "avc1.42e01f",
++    AV1: "av01.0.08M.08",
++    VP8: "vp8",
++    VP9: "vp09.00.10.08"
++};
++
++/** Decodes the plugin's frames into a track for the local preview. */
++class Preview {
++    readonly track: MediaStreamTrack;
++    readonly stream: MediaStream;
++    private writer: WritableStreamDefaultWriter<VideoFrame>;
++    private decoder: VideoDecoder | null = null;
++    private codec = "";
++    private needKey = true;
++
++    constructor() {
++        this.track = new (window as any).MediaStreamTrackGenerator({ kind: "video" });
++        this.writer = (this.track as any).writable.getWriter();
++        this.stream = new MediaStream([this.track]);
++    }
++
++    configure(codec: string) {
++        this.close();
++        this.codec = codec;
++        const name = DECODER_CODECS[codec];
++        if (!name) return;
++        const decoder = new VideoDecoder({
++            output: f => {
++                // A preview that falls behind skips frames rather than lagging.
++                if ((this.writer.desiredSize ?? 1) <= 0) return f.close();
++                this.writer.write(f).catch(() => f.close());
++            },
++            error: e => {
++                logger.warn("preview decoder:", e);
++                if (this.decoder === decoder) this.decoder = null;
++            }
++        });
++        decoder.configure({ codec: name, optimizeForLatency: true });
++        this.decoder = decoder;
++        this.needKey = true;
++    }
++
++    decode(key: boolean, data: ArrayBuffer, ptsUs: number) {
++        if (!this.decoder && key && this.codec) this.configure(this.codec);
++        const d = this.decoder;
++        if (!d || d.state !== "configured" || (this.needKey && !key)) return;
++        if (d.decodeQueueSize > 5) {
++            this.needKey = true;
++            return;
++        }
++        this.needKey = false;
++        d.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: ptsUs, data }));
++    }
++
++    close() {
++        if (this.decoder?.state !== "closed") this.decoder?.close();
++        this.decoder = null;
++    }
++
++    end() {
++        this.close();
++        this.writer.close().catch(() => {});
++    }
++}
++
++interface Unit {
++    key: boolean;
++    data: ArrayBuffer;
++}
++
++interface Session {
++    track: MediaStreamTrack;
++    writer: WritableStreamDefaultWriter<VideoFrame>;
++    preview: Preview;
++    codec: string;
++    kbps: number;
++    width: number;
++    height: number;
++    black: Uint8Array | null;
++    queue: Unit[];
++    sender: RTCRtpSender | null;
++    sawKey: boolean;
++    lastKeyRequest: number;
++    plis: number;
++    poll: ReturnType<typeof setInterval>;
++    swapped: number;
++    dropped: number;
++}
++
++let session: Session | null = null;
++
++function requestKeyframe(s: Session, why: string) {
++    const now = performance.now();
++    if (now - s.lastKeyRequest < KEYFRAME_INTERVAL_MS) return;
++    s.lastKeyRequest = now;
++    logger.info("keyframe request:", why);
++    VesktopNative.obsLive.keyframe();
++}
++
++function blackI420(w: number, h: number) {
++    const y = w * h;
++    const c = (w >> 1) * (h >> 1);
++    const b = new Uint8Array(y + 2 * c);
++    b.fill(16, 0, y);
++    b.fill(128, y);
++    return b;
++}
++
++function onEvent(e: OdlEvent) {
++    const s = session;
++    if (!s) return;
++    switch (e.type) {
++        case "config":
++            logger.info(`OBS encodes ${e.codec} with ${e.encoder}, ${e.width}x${e.height} at ${e.fpsNum}/${e.fpsDen}`);
++            s.width = e.width & ~1;
++            s.height = e.height & ~1;
++            s.black = blackI420(s.width, s.height);
++            s.queue = [];
++            s.preview.configure(e.codec);
++            break;
++        case "frame": {
++            if (!s.black) return;
++            const d = e.data;
++            const data =
++                d.byteOffset === 0 && d.byteLength === d.buffer.byteLength
++                    ? (d.buffer as ArrayBuffer)
++                    : (d.slice().buffer as ArrayBuffer);
++            if (e.key) s.queue = [];
++            else if (s.queue.length >= MAX_QUEUE) {
++                s.queue = [];
++                requestKeyframe(s, "queue overflow");
++            }
++            s.queue.push({ key: e.key, data });
++            s.preview.decode(e.key, data, e.ptsUs);
++            const frame = new VideoFrame(s.black, {
++                format: "I420",
++                codedWidth: s.width,
++                codedHeight: s.height,
++                timestamp: Math.round(performance.now() * 1000)
++            });
++            s.writer.write(frame).catch(err => {
++                logger.info("generator closed:", err);
++                stopSession();
++            });
++            break;
++        }
++        case "error":
++            logger.error("OBS plugin:", e.message);
++            break;
++        case "closed":
++            logger.warn("OBS plugin closed the connection");
++            break;
++    }
++}
++
++async function pollStats(s: Session) {
++    if (s.track.readyState === "ended") return stopSession();
++    if (!s.sender) return;
++    const stats = await s.sender.getStats();
++    stats.forEach((r: any) => {
++        if (r.type !== "outbound-rtp" || r.kind !== "video") return;
++        const plis = (r.pliCount ?? 0) + (r.firCount ?? 0);
++        if (plis > s.plis) requestKeyframe(s, `${plis - s.plis} PLI or FIR`);
++        s.plis = plis;
++        if (typeof r.targetBitrate !== "number" || r.targetBitrate <= 0) return;
++        const kbps = Math.round(r.targetBitrate / 1000);
++        if (Math.abs(kbps - s.kbps) > s.kbps * 0.05) {
++            s.kbps = kbps;
++            VesktopNative.obsLive.setBitrate(kbps);
++        }
++    });
++}
++
++/** Starts a session with the plugin and returns the track that carries it. */
++export function startObsTrack(): MediaStreamTrack {
++    stopSession();
++    const Generator = (window as any).MediaStreamTrackGenerator;
++    const track: MediaStreamTrack = new Generator({ kind: "video" });
++    // Chromium keeps the frame rate under load and gives up resolution instead,
++    // which costs nothing here: every frame it encodes is replaced.
++    track.contentHint = "motion";
++    const s: Session = {
++        track,
++        writer: (track as any).writable.getWriter(),
++        preview: new Preview(),
++        codec: "H264",
++        kbps: START_KBPS,
++        width: 0,
++        height: 0,
++        black: null,
++        queue: [],
++        sender: null,
++        sawKey: false,
++        lastKeyRequest: 0,
++        plis: 0,
++        poll: 0 as any,
++        swapped: 0,
++        dropped: 0
++    };
++    s.poll = setInterval(() => pollStats(s).catch(err => logger.error("stats:", err)), 1000);
++    session = s;
++    VesktopNative.obsLive.start(s.codec, s.kbps);
++    logger.info("session started");
++    return track;
++}
++
++function stopSession() {
++    const s = session;
++    if (!s) return;
++    session = null;
++    clearInterval(s.poll);
++    s.writer.close().catch(() => {});
++    s.preview.end();
++    VesktopNative.obsLive.stop();
++    logger.info(`session stopped: ${s.swapped} frames swapped, ${s.dropped} Chromium frames had no OBS frame`);
++}
++
++function raiseFramerate(sender: RTCRtpSender) {
++    const p = sender.getParameters();
++    const e = p.encodings?.[0];
++    if (!e || (e.maxFramerate ?? 0) >= MAX_FRAMERATE) return;
++    e.maxFramerate = MAX_FRAMERATE;
++    sender.setParameters(p).catch(err => logger.warn("could not raise maxFramerate:", err));
++}
++
++function swap(sender: RTCRtpSender, frame: RTCEncodedVideoFrame, ctl: TransformStreamDefaultController) {
++    const s = session;
++    if (!s || sender.track !== s.track) return ctl.enqueue(frame);
++    if (s.sender !== sender) {
++        s.sender = sender;
++        raiseFramerate(sender);
++    }
++
++    const codec = frame.getMetadata().mimeType?.split("/")[1]?.toUpperCase();
++    if (codec && codec !== s.codec) {
++        logger.info(`the sender negotiated ${codec}; restarting OBS's encoder`);
++        s.codec = codec;
++        s.queue = [];
++        s.black = null;
++        VesktopNative.obsLive.start(codec, s.kbps);
++        return;
++    }
++
++    // Chromium encodes a keyframe on a PLI; the plugin has to as well.
++    if (frame.type === "key") {
++        if (s.sawKey) requestKeyframe(s, "Chromium keyframe");
++        s.sawKey = true;
++    }
++
++    const k = s.queue.findLastIndex(u => u.key);
++    if (k > 0) s.queue.splice(0, k);
++    const unit = s.queue.shift();
++    if (!unit) {
++        s.dropped++;
++        return;
++    }
++    frame.data = unit.data;
++    ctl.enqueue(frame);
++    s.swapped++;
++    if (s.queue.length > MAX_BACKLOG) requestKeyframe(s, `${s.queue.length} frames behind`);
++}
++
++const transformInfo = new WeakMap<object, { worker: Worker; options: any }>();
++const senderKind = new WeakMap<RTCRtpSender, string>();
++const taken = new WeakSet<RTCRtpSender>();
++
++function install() {
++    const NativeTransform = window.RTCRtpScriptTransform;
++    const desc = Object.getOwnPropertyDescriptor(RTCRtpSender.prototype, "transform");
++    if (!NativeTransform || !desc?.set || !(window as any).MediaStreamTrackGenerator) {
++        logger.warn("this Chromium lacks a needed API; OBS streaming is off");
++        return;
++    }
++
++    window.RTCRtpScriptTransform = class extends NativeTransform {
++        constructor(worker: Worker, options?: any, transfer?: any[]) {
++            super(worker, options, transfer);
++            transformInfo.set(this, { worker, options });
++        }
++    } as typeof RTCRtpScriptTransform;
++
++    const { addTransceiver, addTrack } = RTCPeerConnection.prototype;
++    RTCPeerConnection.prototype.addTransceiver = function (this: RTCPeerConnection, trackOrKind: any, init?: any) {
++        const t = addTransceiver.call(this, trackOrKind, init);
++        senderKind.set(t.sender, typeof trackOrKind === "string" ? trackOrKind : trackOrKind.kind);
++        return t;
++    } as typeof addTransceiver;
++    RTCPeerConnection.prototype.addTrack = function (this: RTCPeerConnection, track: MediaStreamTrack, ...streams) {
++        const sender = addTrack.call(this, track, ...streams);
++        senderKind.set(sender, track.kind);
++        return sender;
++    };
++
++    Object.defineProperty(RTCRtpSender.prototype, "transform", {
++        ...desc,
++        set(this: RTCRtpSender, t: any) {
++            if (taken.has(this)) return;
++            const info = t && transformInfo.get(t);
++            const kind = senderKind.get(this) ?? this.track?.kind;
++            if (!session || !info || info.options?.operation !== ENCRYPT || kind !== "video") {
++                return desc.set!.call(this, t);
++            }
++            try {
++                const { readable, writable } = (this as any).createEncodedStreams();
++                const sender = this;
++                const swapped = readable.pipeThrough(
++                    new TransformStream({ transform: (f, ctl) => swap(sender, f, ctl) })
++                );
++                info.worker.postMessage(
++                    { type: RTC_TRANSFORM, operation: info.options.operation, readable: swapped, writable },
++                    [swapped, writable]
++                );
++                taken.add(this);
++                logger.info("took a video sender's encoded frames");
++            } catch (err) {
++                logger.error("could not take the sender's frames; Discord encodes this one", err);
++                desc.set!.call(this, t);
++            }
++        }
++    });
++
++    // A video element handed the Go Live track plays the decoded preview
++    // instead. The getter returns what Discord set, so its own comparisons hold.
++    const srcObject = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "srcObject")!;
++    const assigned = new WeakMap<HTMLMediaElement, { original: MediaStream; shown: MediaStream }>();
++    Object.defineProperty(HTMLMediaElement.prototype, "srcObject", {
++        ...srcObject,
++        get(this: HTMLMediaElement) {
++            const real = srcObject.get!.call(this);
++            const a = assigned.get(this);
++            return a && real === a.shown ? a.original : real;
++        },
++        set(this: HTMLMediaElement, v: MediaProvider | null) {
++            const s = session;
++            if (s && v instanceof MediaStream && v.getVideoTracks().includes(s.track)) {
++                assigned.set(this, { original: v, shown: s.preview.stream });
++                return srcObject.set!.call(this, s.preview.stream);
++            }
++            assigned.delete(this);
++            srcObject.set!.call(this, v);
++        }
++    });
++
++    VesktopNative.obsLive.onEvent(onEvent);
++}
++
++if (navigator.userAgent.includes("Linux")) install();
+diff --git a/src/renderer/patches/screenShareFixes.ts b/src/renderer/patches/screenShareFixes.ts
+index aab817b..7284cf3 100644
+--- a/src/renderer/patches/screenShareFixes.ts
++++ b/src/renderer/patches/screenShareFixes.ts
+@@ -6,6 +6,7 @@
+ 
+ import { Logger } from "@vencord/types/utils";
+ import { currentSettings } from "renderer/components/ScreenSharePicker";
++import { startObsTrack } from "renderer/obsDiscordLive";
+ import { State } from "renderer/settings";
+ import { isLinux } from "renderer/utils";
+ 
+@@ -31,9 +32,17 @@ if (isLinux) {
+         const frameRate = Number(State.store.screenshareQuality?.frameRate ?? 30);
+         const height = Number(State.store.screenshareQuality?.resolution ?? 720);
+         const width = Math.round(height * (16 / 9));
+-        const track = stream.getVideoTracks()[0];
++        let track = stream.getVideoTracks()[0];
+ 
+-        track.contentHint = String(currentSettings?.contentHint);
++        if (currentSettings?.obs && track) {
++            // The capture of Vesktop's own frame only stood in for OBS.
++            stream.removeTrack(track);
++            track.stop();
++            track = startObsTrack();
++            stream.addTrack(track);
++        } else {
++            track.contentHint = String(currentSettings?.contentHint);
++        }
+ 
+         const constraints = {
+             ...track.getConstraints(),
+@@ -44,12 +53,13 @@ if (isLinux) {
+             resizeMode: "none"
+         };
+ 
+-        track
+-            .applyConstraints(constraints)
+-            .then(() => {
+-                logger.info("Applied constraints successfully. New constraints: ", track.getConstraints());
+-            })
+-            .catch(e => logger.error("Failed to apply constraints.", e));
++        if (!currentSettings?.obs)
++            track
++                .applyConstraints(constraints)
++                .then(() => {
++                    logger.info("Applied constraints successfully. New constraints: ", track.getConstraints());
++                })
++                .catch(e => logger.error("Failed to apply constraints.", e));
+ 
+         if (id) {
+             const audio = await navigator.mediaDevices.getUserMedia({
+diff --git a/src/shared/IpcEvents.ts b/src/shared/IpcEvents.ts
+index 13f27b4..36082ed 100644
+--- a/src/shared/IpcEvents.ts
++++ b/src/shared/IpcEvents.ts
+@@ -61,7 +61,13 @@ export const enum IpcEvents {
+     DEVTOOLS_OPENED = "VCD_DEVTOOLS_OPENED",
+     DEVTOOLS_CLOSED = "VCD_DEVTOOLS_CLOSED",
+ 
+-    CHOOSE_USER_ASSET = "VCD_CHOOSE_USER_ASSET"
++    CHOOSE_USER_ASSET = "VCD_CHOOSE_USER_ASSET",
++
++    ODL_START = "VCD_ODL_START",
++    ODL_KEYFRAME = "VCD_ODL_KEYFRAME",
++    ODL_SET_BITRATE = "VCD_ODL_SET_BITRATE",
++    ODL_STOP = "VCD_ODL_STOP",
++    ODL_EVENT = "VCD_ODL_EVENT"
+ }
+ 
+ export const enum UpdaterIpcEvents {

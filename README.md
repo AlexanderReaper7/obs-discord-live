@@ -3,7 +3,7 @@
 Streams OBS's program view into a Discord Go Live without Discord encoding it a second time. Two parts:
 
 - `plugin/` is an OBS output in Rust. It takes raw I420 frames at the canvas's output size and rate, encodes them through OBS's own libavcodec, and serves them on `$XDG_RUNTIME_DIR/obs-discord-live.sock`. The client can ask for a keyframe (a PLI from a viewer) and set the bitrate (the sender's bandwidth estimate). The output has no button; it runs while a client holds a session.
-- The Vesktop patch (not written yet) puts the plugin's frames into the Go Live sender inside Discord's encryption worker, and forwards PLIs and `targetBitrate` back. Design below.
+- `vesktop/obs-discord-live.patch`, against Vesktop 1.6.7, adds OBS as a Go Live source. It puts the plugin's frames into the Go Live sender ahead of Discord's encryption, and forwards keyframe requests and `targetBitrate` back. Design below.
 
 `proto/` is the wire format, documented in `proto/src/lib.rs`. `client/` is a test client that stands in for Vesktop.
 
@@ -38,14 +38,28 @@ Measured 2026-10-24 in Vesktop 1.6.7 (Electron 43, Chrome 150) with `phase0/prob
 
 ## Design of the Vesktop side
 
-Decided 2026-10-24 from the measurements above.
+Decided 2026-10-24 from the measurements above and `phase0/loopback.js`.
 
-- **The swap happens in Discord's encryption worker, before encryption.** A prelude wraps the worker's `onrtctransform` so that, for the video encrypt operation, each frame's `data` becomes the plugin's access unit before Discord's own code sees it. Discord's encryption, packetization and congestion control stay as they are.
-- **Chromium's frame clock follows the plugin's.** H.264 P-frames reference every frame before them, so the swap must be one plugin frame per Chromium frame, and Chromium captures at its own rate (25 fps measured). The Go Live track is therefore a `MediaStreamTrackGenerator` that emits one black 1280x720 `VideoFrame` per plugin frame. OpenH264 encodes black almost for free and never needs to drop a frame for bitrate.
-- **A lost frame costs a keyframe.** If Chromium drops a generated frame anyway, the plugin's frame for it never goes out and the next ones reference it; the worker then asks the plugin for a keyframe.
-- **Feedback.** A rising `pliCount` or `firCount`, or OpenH264 producing a keyframe nobody asked it for, becomes `KeyframeRequest`. `targetBitrate` becomes `SetBitrate`, polled every second.
-- **The plugin socket stays in Vesktop's main process**, which can open Unix sockets; frames reach the worker over IPC and a `MessagePort`.
-- **WebRTC uses only the default-route interface.** strix gathers 34 local candidates (Docker bridges, `svmbr0`, Tailscale, Mullvad), all leaving through one public IP on different ports. One Go Live attempt nominated the Docker bridge `172.23.0.1` and never finished DTLS: 22 packets out, 0 bytes back. `--force-webrtc-ip-handling-policy` had no effect in Electron 43, so the patch calls `webContents.setWebRTCIPHandlingPolicy("default_public_interface_only")`.
+- **OBS is a source in the picker.** When the plugin's socket exists, Vesktop's picker shows an OBS card, and on Wayland a Portal card for the usual screen capture. Picking OBS hands Electron's display media handler Vesktop's own frame, so no portal dialog appears, and the page swaps that track for a `MediaStreamTrackGenerator`.
+- **The swap happens in the page, before Discord's encryption.** Every sender gets an `RTCRtpScriptTransform` into Discord's `encryption-worker`, and a sender takes one transform. For a video sender while an OBS session runs, the patch calls `createEncodedStreams()` instead, pipes the frames through its swap, and posts the streams to the same worker as `{type: 1, operation: 0, readable, writable}`, the message the worker already handles for a transform. Discord's encryption, packetization and congestion control are untouched.
+- **One black frame per plugin frame.** The generator gets a black I420 frame at the plugin's size for each access unit, so OpenH264 encodes almost nothing and the sender emits one encoded frame per plugin frame.
+- **Frames pair in order, not by timestamp.** In the loopback test an encoded frame's RTP timestamp followed the wall clock of the `write()`, not `VideoFrame.timestamp`, with residuals up to 43 ms, and Chromium dropped 2 of 88 frames. The swap is a queue: each encoded frame takes the oldest access unit; a queued plugin keyframe discards everything older; an encoded frame with no access unit waiting is dropped. A queue more than 2 frames behind asks the plugin for a keyframe.
+- **Feedback.** A keyframe from OpenH264 after the first (it makes one on a PLI) and a rising `pliCount` or `firCount` become `KeyframeRequest`. `targetBitrate` from the sender's stats becomes `SetBitrate` when it moves more than 5 %, polled every second.
+- **The encoding's frame rate cap is raised to 60.** At Discord's 30, Chromium dropped about one generated frame a minute that arrived early; at 60 it dropped none in a minute. Each drop costs a keyframe.
+- **The local preview decodes the plugin's frames.** Discord's preview plays the sender's track, which is black. A `VideoDecoder` feeds a second generator track, and a `<video>` handed the Go Live track gets that one; the `srcObject` getter still returns what Discord set.
+- **The plugin socket stays in Vesktop's main process**, which can open Unix sockets; access units reach the page over IPC.
+- **WebRTC uses only the default-route interface.** strix gathers 34 local candidates (Docker bridges, `svmbr0`, Tailscale, Mullvad), all leaving through one public IP on different ports. One Go Live attempt nominated the Docker bridge `172.23.0.1` and never finished DTLS: 22 packets out, 0 bytes back. `--force-webrtc-ip-handling-policy` had no effect in Electron 43, so the patch calls `webContents.setWebRTCIPHandlingPolicy("default_public_interface_only")` on the main window. That applies to voice calls too.
+
+## Install with nix
+
+The flake has `packages.x86_64-linux.default`, the plugin, and `packages.x86_64-linux.vesktop`, nixpkgs's Vesktop with the patch. For a NixOS config, `lib.plugin { pkgs; cpuArch = "znver5"; }` builds the plugin for a CPU, and `lib.vesktop { pkgs; }` the patched Vesktop:
+
+```nix
+programs.obs-studio.plugins = [ (inputs.obs-discord-live.lib.plugin { inherit pkgs; cpuArch = config.mine.cpu.arch; }) ];
+environment.systemPackages = [ (inputs.obs-discord-live.lib.vesktop { inherit pkgs; }) ];
+```
+
+The patch is the one commit on top of Vesktop 1.6.7's source; it changes no dependency, so nixpkgs's pnpm hash still holds.
 
 ## Build and install for development
 
