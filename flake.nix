@@ -143,10 +143,21 @@
 
       # Vesktop with OBS as a Go Live source. The lockfile is unchanged, so
       # nixpkgs's pnpm dependency hash still holds.
+      # `obsAddress`, e.g. "192.168.1.62:4457" for OBS in a VM guest, becomes
+      # the default OBS_DISCORD_LIVE_ADDR in Vesktop's wrapper only, so an OBS
+      # on the host still listens on its own socket.
       lib.vesktop =
-        { pkgs }:
+        {
+          pkgs,
+          obsAddress ? null,
+        }:
         pkgs.vesktop.overrideAttrs (old: {
           patches = (old.patches or [ ]) ++ [ ./vesktop/obs-discord-live.patch ];
+          postFixup =
+            (old.postFixup or "")
+            + pkgs.lib.optionalString (obsAddress != null) ''
+              wrapProgram $out/bin/vesktop --set-default OBS_DISCORD_LIVE_ADDR ${pkgs.lib.escapeShellArg obsAddress}
+            '';
         });
 
       packages.${system} = {

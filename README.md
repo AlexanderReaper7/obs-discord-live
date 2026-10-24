@@ -66,11 +66,11 @@ Decided 2026-10-24 from the measurements above and `phase0/loopback.js`.
 
 ## Install with nix
 
-The flake has `packages.x86_64-linux.default`, the plugin, `packages.x86_64-linux.vesktop`, nixpkgs's Vesktop with the patch, and `packages.x86_64-linux.windows`, the plugin as a DLL for OBS 33.0.0 on Windows x64. For a NixOS config, `lib.plugin { pkgs; cpuArch = "znver5"; }` builds the plugin for a CPU, and `lib.vesktop { pkgs; }` the patched Vesktop:
+The flake has `packages.x86_64-linux.default`, the plugin, `packages.x86_64-linux.vesktop`, nixpkgs's Vesktop with the patch, and `packages.x86_64-linux.windows`, the plugin as a DLL for OBS 33.0.0 on Windows x64. For a NixOS config, `lib.plugin { pkgs; cpuArch = "znver5"; }` builds the plugin for a CPU, and `lib.vesktop { pkgs; obsAddress = "192.168.1.62:4457"; }` the patched Vesktop, with `obsAddress` as its default `OBS_DISCORD_LIVE_ADDR` (omit it for OBS on the same machine):
 
 ```nix
 programs.obs-studio.plugins = [ (inputs.obs-discord-live.lib.plugin { inherit pkgs; cpuArch = config.mine.cpu.arch; }) ];
-environment.systemPackages = [ (inputs.obs-discord-live.lib.vesktop { inherit pkgs; }) ];
+environment.systemPackages = [ (inputs.obs-discord-live.lib.vesktop { inherit pkgs; obsAddress = "192.168.1.62:4457"; }) ];
 ```
 
 The patch is the one commit on top of Vesktop 1.6.7's source; it changes no dependency, so nixpkgs's pnpm hash still holds.
