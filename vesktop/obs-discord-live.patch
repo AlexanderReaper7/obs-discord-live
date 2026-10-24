@@ -1,4 +1,4 @@
-From a9d94ae36509280b923fc518b01f70ff955b2e7a Mon Sep 17 00:00:00 2001
+From 7846ce239090fb3c82b674a2b971f404363ab0ac Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Alexander=20=C3=96berg?=
  <24926972+AlexanderReaper7@users.noreply.github.com>
 Date: Sat, 24 Oct 2026 23:17:00 +0200
@@ -6,14 +6,14 @@ Subject: [PATCH] obs-discord-live: OBS as a Go Live source
 
 ---
  src/main/mainWindow.ts                        |   4 +
- src/main/obsDiscordLive.ts                    | 143 +++++++
- src/main/screenShare.ts                       |  32 +-
+ src/main/obsDiscordLive.ts                    | 159 +++++++
+ src/main/screenShare.ts                       |  33 +-
  src/preload/VesktopNative.ts                  |  10 +
  src/renderer/components/ScreenSharePicker.tsx |  62 +--
  src/renderer/obsDiscordLive.ts                | 397 ++++++++++++++++++
  src/renderer/patches/screenShareFixes.ts      |  26 +-
  src/shared/IpcEvents.ts                       |   8 +-
- 8 files changed, 644 insertions(+), 38 deletions(-)
+ 8 files changed, 661 insertions(+), 38 deletions(-)
  create mode 100644 src/main/obsDiscordLive.ts
  create mode 100644 src/renderer/obsDiscordLive.ts
 
@@ -34,10 +34,10 @@ index daf0c0c..fea9f9f 100644
      if (process.platform === "darwin" && Settings.store.customTitleBar) win.setWindowButtonVisibility(false);
 diff --git a/src/main/obsDiscordLive.ts b/src/main/obsDiscordLive.ts
 new file mode 100644
-index 0000000..8ebbbf8
+index 0000000..ace53f9
 --- /dev/null
 +++ b/src/main/obsDiscordLive.ts
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,159 @@
 +/*
 + * Vesktop, a desktop app aiming to give you a snappier Discord Experience
 + * Copyright (c) 2026 Vendicated and Vencord contributors
@@ -45,13 +45,14 @@ index 0000000..8ebbbf8
 + */
 +
 +// Client for the obs-discord-live OBS plugin. The plugin encodes OBS's program
-+// view and serves access units on a Unix socket; this side relays them to the
++// view and serves access units on a Unix socket, or on TCP when OBS runs in a
++// VM guest ($OBS_DISCORD_LIVE_ADDR=HOST:PORT); this side relays them to the
 +// renderer, which puts them into the Go Live sender. Wire format: every message
 +// is a u32 LE length of what follows, one type byte, then the payload; strings
 +// are a u8 length and UTF-8. See proto/src/lib.rs in obs-discord-live.
 +
 +import { existsSync } from "fs";
-+import { connect, Socket } from "net";
++import { connect, NetConnectOpts, Socket } from "net";
 +import { join } from "path";
 +import { IpcEvents } from "shared/IpcEvents";
 +
@@ -75,13 +76,28 @@ index 0000000..8ebbbf8
 +    | { type: "error"; message: string }
 +    | { type: "closed" };
 +
-+export function socketPath() {
-+    return join(process.env.XDG_RUNTIME_DIR || "/tmp", "obs-discord-live.sock");
++/** `$OBS_DISCORD_LIVE_ADDR`, HOST:PORT for TCP or a socket path, else the plugin's default socket. Matches `addr()` in proto/src/lib.rs. */
++export function address(): NetConnectOpts {
++    const v = process.env.OBS_DISCORD_LIVE_ADDR;
++    const tcp = v && !/[/\\]/.test(v) ? /^(.*):(\d+)$/.exec(v) : null;
++    if (tcp) return { host: tcp[1].replace(/^\[(.*)\]$/, "$1"), port: Number(tcp[2]), noDelay: true };
++    return { path: v || join(process.env.XDG_RUNTIME_DIR || "/tmp", "obs-discord-live.sock") };
 +}
 +
-+/** The plugin listens only while OBS runs with it loaded. */
-+export function obsAvailable() {
-+    return process.platform === "linux" && existsSync(socketPath());
++/** The plugin listens only while OBS runs with it loaded. A TCP address is probed with a connect that the plugin sees as a client that left. */
++export function obsAvailable(): Promise<boolean> {
++    const a = address();
++    if ("path" in a) return Promise.resolve(process.platform === "linux" && existsSync(a.path));
++    return new Promise(resolve => {
++        const s = connect(a);
++        const done = (ok: boolean) => {
++            s.destroy();
++            resolve(ok);
++        };
++        s.setTimeout(500, () => done(false));
++        s.once("connect", () => done(true));
++        s.once("error", () => done(false));
++    });
 +}
 +
 +let sock: Socket | null = null;
@@ -141,7 +157,7 @@ index 0000000..8ebbbf8
 +
 +function start(codec: string, kbps: number) {
 +    stop();
-+    const s = connect(socketPath());
++    const s = connect(address());
 +    sock = s;
 +    let buf: Buffer = Buffer.alloc(0);
 +    s.on("data", (chunk: Buffer) => {
@@ -182,7 +198,7 @@ index 0000000..8ebbbf8
 +handle(IpcEvents.ODL_SET_BITRATE, (_, kbps: number) => sock?.write(message(C_BITRATE, u32(kbps))));
 +handle(IpcEvents.ODL_STOP, () => stop());
 diff --git a/src/main/screenShare.ts b/src/main/screenShare.ts
-index a96b1ce..cf69bf2 100644
+index a96b1ce..e1546e6 100644
 --- a/src/main/screenShare.ts
 +++ b/src/main/screenShare.ts
 @@ -9,8 +9,20 @@ import type { StreamPick } from "renderer/components/ScreenSharePicker";
@@ -206,14 +222,15 @@ index a96b1ce..cf69bf2 100644
  const isWayland =
      process.platform === "linux" && (process.env.XDG_SESSION_TYPE === "wayland" || !!process.env.WAYLAND_DISPLAY);
  
-@@ -27,6 +39,23 @@ export function registerScreenShareHandler() {
+@@ -27,6 +39,24 @@ export function registerScreenShareHandler() {
      });
  
      session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
 +        // With the obs-discord-live plugin listening, OBS is a source. Picking it
 +        // captures Vesktop's own frame, which needs no portal; the renderer
 +        // replaces that track with one that carries OBS's encoded frames.
-+        if (isWayland && obsAvailable()) {
++        const obs = await obsAvailable();
++        if (isWayland && obs) {
 +            const choice = await sendRendererCommand<StreamPick>(IpcCommands.SCREEN_SHARE_PICKER, {
 +                screens: [obsSource(), { id: PORTAL_SOURCE_ID, name: "Screen or window", url: svgCard("Portal") }],
 +                skipPicker: false
@@ -230,16 +247,16 @@ index a96b1ce..cf69bf2 100644
          // request full resolution on wayland right away because we always only end up with one result anyway
          const width = isWayland ? 1920 : 176;
          const sources = await desktopCapturer
-@@ -63,7 +92,7 @@ export function registerScreenShareHandler() {
+@@ -63,7 +93,7 @@ export function registerScreenShareHandler() {
          }
  
          const choice = await sendRendererCommand<StreamPick>(IpcCommands.SCREEN_SHARE_PICKER, {
 -            screens: data,
-+            screens: obsAvailable() ? [obsSource(), ...data] : data,
++            screens: obs ? [obsSource(), ...data] : data,
              skipPicker: false
          }).catch(e => {
              console.error("Error during screenshare picker", e);
-@@ -71,6 +100,7 @@ export function registerScreenShareHandler() {
+@@ -71,6 +101,7 @@ export function registerScreenShareHandler() {
          });
  
          if (!choice) return callback({});
@@ -843,3 +860,6 @@ index 13f27b4..36082ed 100644
  }
  
  export const enum UpdaterIpcEvents {
+-- 
+2.55.0
+
