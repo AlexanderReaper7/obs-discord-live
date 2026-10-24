@@ -23,3 +23,5 @@ elif cmd == "dump":
     r = asyncio.run(evaluate("JSON.stringify(window.__p0 ?? null)"))
     pathlib.Path(sys.argv[2]).write_text(r["result"]["value"])
     print("wrote", sys.argv[2])
+elif cmd == "eval":
+    print(json.dumps(asyncio.run(evaluate(sys.argv[2])).get("result", {}).get("value"), indent=1))

@@ -3,7 +3,7 @@
 Streams OBS's program view into a Discord Go Live without Discord encoding it a second time. Two parts:
 
 - `plugin/` is an OBS output in Rust. It takes raw I420 frames at the canvas's output size and rate, encodes them through OBS's own libavcodec, and serves them on `$XDG_RUNTIME_DIR/obs-discord-live.sock`. The client can ask for a keyframe (a PLI from a viewer) and set the bitrate (the sender's bandwidth estimate). The output has no button; it runs while a client holds a session.
-- The Vesktop patch (not written yet) replaces the Go Live sender's encoded frames with the plugin's through an encoded transform and forwards PLIs and `targetBitrate` back.
+- The Vesktop patch (not written yet) puts the plugin's frames into the Go Live sender inside Discord's encryption worker, and forwards PLIs and `targetBitrate` back. Design below.
 
 `proto/` is the wire format, documented in `proto/src/lib.rs`. `client/` is a test client that stands in for Vesktop.
 
@@ -23,6 +23,29 @@ Picked by the codec the client names, which is the one Discord negotiated:
 | VP9 | libvpx-vp9 realtime, CBR, cyclic refresh | reopen, same limits |
 
 `ODL_X264_PROFILE=high` in OBS's environment trades the baseline profile for about 10 % less bitrate, if the receivers accept it.
+
+## What Discord's Go Live sender is
+
+Measured 2026-10-24 in Vesktop 1.6.7 (Electron 43, Chrome 150) with `phase0/probe.js` over CDP, during a Go Live with one viewer:
+
+- Discord negotiates H.264 `42e01f` (constrained baseline 3.1, packetization mode 1), RTX, `nack`, `nack pli`, `ccm fir`, transport-cc and REMB. Chromium encodes it with OpenH264, one layer (`L1T1`).
+- Both connections have `encodedInsertableStreams: true`, and every sender carries an `RTCRtpScriptTransform` into a worker named `encryption-worker`: Discord's end-to-end encryption. A sender takes one transform, so the patch cannot add its own.
+- In that worker, `RTCEncodedVideoFrame.data` has a setter. `RTCRtpScriptTransformer` has `sendKeyFrameRequest` but no `generateKeyFrame`.
+- Outbound stats carry `targetBitrate` (3.5 Mbps with a viewer), `pliCount`, `firCount`, `nackCount` and `keyFramesEncoded`.
+- With no viewer, Discord's transform passes no frames on: Chromium counts frames encoded and sent while the connection moves 0 RTP packets.
+- Chromium delivered 25 fps from a `getDisplayMedia` that asked for 1920x1080 at 30.
+- `MediaStreamTrackGenerator` exists in the page.
+
+## Design of the Vesktop side
+
+Decided 2026-10-24 from the measurements above.
+
+- **The swap happens in Discord's encryption worker, before encryption.** A prelude wraps the worker's `onrtctransform` so that, for the video encrypt operation, each frame's `data` becomes the plugin's access unit before Discord's own code sees it. Discord's encryption, packetization and congestion control stay as they are.
+- **Chromium's frame clock follows the plugin's.** H.264 P-frames reference every frame before them, so the swap must be one plugin frame per Chromium frame, and Chromium captures at its own rate (25 fps measured). The Go Live track is therefore a `MediaStreamTrackGenerator` that emits one black 1280x720 `VideoFrame` per plugin frame. OpenH264 encodes black almost for free and never needs to drop a frame for bitrate.
+- **A lost frame costs a keyframe.** If Chromium drops a generated frame anyway, the plugin's frame for it never goes out and the next ones reference it; the worker then asks the plugin for a keyframe.
+- **Feedback.** A rising `pliCount` or `firCount`, or OpenH264 producing a keyframe nobody asked it for, becomes `KeyframeRequest`. `targetBitrate` becomes `SetBitrate`, polled every second.
+- **The plugin socket stays in Vesktop's main process**, which can open Unix sockets; frames reach the worker over IPC and a `MessagePort`.
+- **WebRTC uses only the default-route interface.** strix gathers 34 local candidates (Docker bridges, `svmbr0`, Tailscale, Mullvad), all leaving through one public IP on different ports. One Go Live attempt nominated the Docker bridge `172.23.0.1` and never finished DTLS: 22 packets out, 0 bytes back. `--force-webrtc-ip-handling-policy` had no effect in Electron 43, so the patch calls `webContents.setWebRTCIPHandlingPolicy("default_public_interface_only")`.
 
 ## Build and install for development
 
