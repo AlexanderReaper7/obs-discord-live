@@ -1,4 +1,4 @@
-//! The socket the client connects to (`odl_proto::addr`), and the state the OBS side shares with it.
+//! The socket the client connects to (the settings' address), and the state the OBS side shares with it.
 
 use std::io;
 use std::net::TcpListener;
@@ -38,6 +38,10 @@ pub struct Shared {
 }
 
 impl Shared {
+    pub fn has_client(&self) -> bool {
+        self.client.lock().unwrap().is_some()
+    }
+
     /// Sends to the current client. A failed write drops the client and stops
     /// the output, the same as a disconnect.
     pub fn send(&self, msg: &ServerMsg) {
@@ -78,14 +82,14 @@ impl Listener {
         }
     }
 
-    fn accept(&self) -> io::Result<Stream> {
+    /// The stream, and the peer's address for TCP.
+    fn accept(&self) -> io::Result<(Stream, Option<std::net::SocketAddr>)> {
         match self {
             #[cfg(unix)]
-            Listener::Unix(l) => l.accept().map(|(s, _)| Stream::Unix(s)),
+            Listener::Unix(l) => l.accept().map(|(s, _)| (Stream::Unix(s), None)),
             Listener::Tcp(l) => {
                 let (s, peer) = l.accept()?;
-                crate::info(&format!("connection from {peer}"));
-                Stream::tcp(s)
+                Stream::tcp(s).map(|s| (s, Some(peer)))
             }
         }
     }
@@ -111,11 +115,12 @@ pub struct Server {
     readers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
-pub fn spawn(shared: Arc<Shared>) -> io::Result<Server> {
-    let addr = odl_proto::addr();
+pub fn spawn(shared: Arc<Shared>, addr: Addr) -> io::Result<Server> {
     let listener = Listener::bind(&addr).map_err(|e| io::Error::new(e.kind(), format!("{addr}: {e}")))?;
     let wake = listener.wake_addr(&addr);
     crate::info(&format!("listening on {addr}"));
+    // A restart reuses the Shared a shutdown set this on.
+    shared.quit.store(false, Ordering::SeqCst);
     let readers: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
     let r = readers.clone();
     let accept = std::thread::Builder::new()
@@ -127,7 +132,10 @@ pub fn spawn(shared: Arc<Shared>) -> io::Result<Server> {
                     break;
                 }
                 match stream {
-                    Ok(s) => {
+                    Ok((s, peer)) => {
+                        if let Some(peer) = peer {
+                            crate::info(&format!("connection from {peer}"));
+                        }
                         let mut list = r.lock().unwrap();
                         list.retain(|h| !h.is_finished());
                         if let Some(h) = connect(&shared, s) {
@@ -210,6 +218,10 @@ fn read_loop(shared: &Shared, id: u64, mut stream: Stream) {
 }
 
 impl Server {
+    pub fn addr(&self) -> &Addr {
+        &self.addr
+    }
+
     /// Joins every thread the server started, so none runs after OBS unloads the module.
     pub fn shutdown(&mut self, shared: &Shared) {
         shared.quit.store(true, Ordering::SeqCst);

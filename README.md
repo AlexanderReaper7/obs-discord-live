@@ -2,7 +2,7 @@
 
 Streams OBS's program view into a Discord Go Live without Discord encoding it a second time. Two parts:
 
-- `plugin/` is an OBS output in Rust, for Linux and Windows. It takes raw I420 frames at the canvas's output size and rate, encodes them through OBS's own libavcodec, and serves them on `$XDG_RUNTIME_DIR/obs-discord-live.sock` on Linux and TCP port 4457 on Windows. `OBS_DISCORD_LIVE_ADDR` overrides either: `HOST:PORT` is TCP, anything else a socket path. The client can ask for a keyframe (a PLI from a viewer) and set the bitrate (the sender's bandwidth estimate). The output has no button; it runs while a client holds a session.
+- `plugin/` is an OBS output in Rust, for Linux and Windows. It takes raw I420 frames at the canvas's output size and rate, encodes them through OBS's own libavcodec, and serves them on `$XDG_RUNTIME_DIR/obs-discord-live.sock` on Linux and TCP port 4457 on Windows. The listen address in its settings, or `OBS_DISCORD_LIVE_ADDR`, overrides either: `HOST:PORT` is TCP, anything else a socket path. The client can ask for a keyframe (a PLI from a viewer) and set the bitrate (the sender's bandwidth estimate). The output has no button; it runs while a client holds a session. Its settings are under Tools → Discord Go Live (below).
 - `vesktop/obs-discord-live.patch`, against Vesktop 1.6.7, adds OBS as a Go Live source. It puts the plugin's frames into the Go Live sender ahead of Discord's encryption, and forwards keyframe requests and `targetBitrate` back. Design below.
 
 `proto/` is the wire format, documented in `proto/src/lib.rs`. `client/` is a test client that stands in for Vesktop.
@@ -39,15 +39,30 @@ Picked by the codec the client names, which is the one Discord negotiated. Disco
 
 | Codec | Encoder | Bitrate change |
 | --- | --- | --- |
-| H264 | libx264, veryfast, zerolatency, constrained baseline (`42e01f`), no scene cuts | live, next frame |
+| H264 | libx264, veryfast, zerolatency, constrained baseline (`42e01f`), no scene cuts; or NVENC | live, next frame |
 | AV1 | libsvtav1 preset 10, `rtc=1`, low-delay | reopen plus keyframe, at most every 2 s and only for a change over 15 % |
 | VP8 | libvpx realtime, CBR | reopen, same limits |
 | VP9 | libvpx-vp9 realtime, CBR, cyclic refresh | reopen, same limits |
 
-There is no settings UI. Two variables in OBS's environment change the H.264 encoder:
+## Settings
 
-- `ODL_X264_PROFILE=high` trades the baseline profile for about 10 % less bitrate, if the receivers accept it.
-- `ODL_H264_ENCODER=h264_nvenc` encodes on NVENC instead of libx264 (CBR, `p4`, `ull`, live bitrate changes). It is off by default: in the guest on 2026-10-24, each NVENC probe hung the passed-through RTX 3080 (`nvlddmkm` event 153), and the second hang ended the running game with `DXGI_ERROR_DEVICE_HUNG`. OBS's own NVENC test program is moved out of the guest's install for the same reason.
+Tools → Discord Go Live in OBS opens OBS's own properties window for the plugin:
+
+| Setting | Default | Applies |
+| --- | --- | --- |
+| H.264 encoder: x264 or NVENC | x264 | next Go Live |
+| H.264 profile: constrained baseline, main, high | constrained baseline, what WebRTC offers | next Go Live |
+| x264 preset, ultrafast to medium | veryfast | next Go Live |
+| NVENC preset, p1 to p7 | p4 | next Go Live |
+| Keyframe interval, 1 to 60 s | 10 s | next Go Live |
+| Maximum bitrate, 100 to 50000 kbps | 50000 | at once |
+| Listen address | empty: `OBS_DISCORD_LIVE_ADDR`, else the default above | at once; ends a running Go Live |
+
+The window also shows where the plugin listens, whether a client is connected, and what it is encoding. The settings are saved to `plugin_config/obs-discord-live/settings.json` in OBS's config directory, the same for every profile.
+
+Decided 2026-10-25: OBS has no settings page for an output, and a dock needs Qt in C++. The frontend API does open the properties window of any source, so the plugin registers a source type hidden from Add Source, keeps one private instance of it as the settings, and adds a Tools menu item that opens its window. The window applies nothing until OK. The settings replace the `ODL_X264_PROFILE` and `ODL_H264_ENCODER` variables of 2026-10-24. The low-delay options (zerolatency, no B-frames, no lookahead, no scene cuts) are not settings: the frame pairing in Vesktop depends on one encoded frame per input frame.
+
+NVENC is not the default: in the guest on 2026-10-24, each NVENC probe hung the passed-through RTX 3080 (`nvlddmkm` event 153), and the second hang ended the running game with `DXGI_ERROR_DEVICE_HUNG`. The window warns about it. OBS's own NVENC test program is moved out of the guest's install for the same reason.
 
 ## What Discord's Go Live sender is
 
@@ -125,3 +140,5 @@ target/release/odl-client H264 2500 10 test-out/h.264 --keyframe-at 90 --bitrate
 VP8 does not get down to 800 kbps on this content; the cause is not measured yet. Zero frames dropped between OBS and the encoder in every run. Quitting OBS removes the socket and OBS reports 0 memory leaks.
 
 2026-10-25, OBS 33.0.0 in the adversary guest, the znver5 DLL from `nix build .#windows`, the guest profile above, the Windows desktop on screen (Warframe not running). `odl-client H264 2500 8` over an SSH tunnel to the guest's port 4457, a keyframe request after frame 90, 800 kbps from frame 120: libx264 constrained baseline 1280x720 yuv420p BT.709 limited range, keyframes at 0 and 90, 614 kbps after the drop, and ffmpeg decoded it without an error. OBS reported 240 output frames, 0 skipped, 0.31 ms average render time.
+
+2026-10-25, the settings window in OBS 32.2.2 on strix. A hand-written `settings.json` (profile high, keyframes every 2 s, 1500 kbps cap) gave a High profile stream with keyframes at frames 0, 60 and 120. A 300 kbps cap gave 207 kbps where the uncapped stream ran at 880, and a listen address of `127.0.0.1:14999` moved the socket to TCP. Tools → Discord Go Live opened the window with those values and the status lines; Defaults and OK wrote `{}` to the file, moved the socket back to `$XDG_RUNTIME_DIR` without an OBS restart, and the next stream was constrained baseline.

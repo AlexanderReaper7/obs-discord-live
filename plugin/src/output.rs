@@ -19,6 +19,13 @@ pub const ID: &CStr = c"discord_live_output";
 /// The one instance the plugin creates; null before post-load and after exit.
 pub static OUTPUT: AtomicPtr<obs::obs_output_t> = AtomicPtr::new(ptr::null_mut());
 
+/// What the running encoder does, for the settings window; None when stopped.
+static ENCODING: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn encoding() -> Option<String> {
+    ENCODING.lock().unwrap().clone()
+}
+
 pub enum Action {
     Start,
     Stop,
@@ -115,10 +122,7 @@ unsafe extern "C" fn start(data: *mut c_void) -> bool {
         height: ovi.output_height,
         fps_num: ovi.fps_num,
         fps_den: ovi.fps_den,
-        bitrate_kbps: shared
-            .bitrate_kbps
-            .load(Ordering::SeqCst)
-            .clamp(crate::encoder::MIN_KBPS, crate::encoder::MAX_KBPS),
+        bitrate_kbps: crate::encoder::clamp_kbps(shared.bitrate_kbps.load(Ordering::SeqCst)),
     };
     let conversion = obs::video_scale_info {
         format: obs::video_format_VIDEO_FORMAT_I420,
@@ -138,16 +142,17 @@ unsafe extern "C" fn start(data: *mut c_void) -> bool {
             return fail(out, &e);
         }
     };
-    crate::info(&format!(
-        "encoding {} with {} at {}x{} {}/{} fps, {} kbps",
+    let what = format!(
+        "{} with {} at {}x{} {}/{} fps",
         settings.codec.name(),
         encoder.name,
         settings.width,
         settings.height,
         settings.fps_num,
         settings.fps_den,
-        settings.bitrate_kbps
-    ));
+    );
+    crate::info(&format!("encoding {what}, {} kbps", settings.bitrate_kbps));
+    *ENCODING.lock().unwrap() = Some(what);
     shared.send(&ServerMsg::Config {
         codec: settings.codec.name().into(),
         encoder: encoder.name.into(),
@@ -203,6 +208,7 @@ fn encode_loop(mut encoder: Encoder, rx: Receiver<ff::frame::Video>, shared: Arc
 
 fn stop_run(out: &Output) {
     let run = out.run.lock().unwrap().take();
+    *ENCODING.lock().unwrap() = None;
     if let Some(run) = run {
         drop(run.tx);
         let _ = run.thread.join();

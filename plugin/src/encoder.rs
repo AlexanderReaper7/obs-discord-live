@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use ffmpeg_next as ff;
 
+use crate::settings::Config;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
     H264,
@@ -67,26 +69,30 @@ pub struct Encoder {
 /// Encoders that take a new bitrate on the next frame, without a reopen.
 const LIVE_RATE: [&str; 2] = ["libx264", "h264_nvenc"];
 
-/// The H.264 encoder. `ODL_H264_ENCODER=h264_nvenc` picks NVENC, never the
-/// default: in the adversary guest on 2026-10-24 each NVENC probe (OBS's
-/// obs-nvenc-test.exe, at OBS start and once by hand) hung the passed-through
-/// 3080 (nvlddmkm event 153), and the second hang killed the running game with
-/// DXGI_ERROR_DEVICE_HUNG.
-fn h264_order() -> Vec<&'static str> {
-    match std::env::var("ODL_H264_ENCODER").as_deref() {
-        Ok("h264_nvenc") => vec!["h264_nvenc"],
+/// The encoder's bitrate: the receiver's estimate within the settings' maximum.
+pub fn clamp_kbps(kbps: u32) -> u32 {
+    kbps.clamp(MIN_KBPS, crate::settings::max_kbps())
+}
+
+/// The H.264 encoder from the settings. NVENC is never the default: in the
+/// adversary guest on 2026-10-24 each NVENC probe (OBS's obs-nvenc-test.exe, at
+/// OBS start and once by hand) hung the passed-through 3080 (nvlddmkm event
+/// 153), and the second hang killed the running game with DXGI_ERROR_DEVICE_HUNG.
+fn h264_order(c: &Config) -> Vec<&'static str> {
+    match c.h264_encoder.as_str() {
+        "h264_nvenc" => vec!["h264_nvenc"],
         _ => vec!["libx264"],
     }
 }
 
 /// The private options for each libavcodec encoder. Every set is low-delay: no
-/// B-frames, no lookahead, a keyframe only on request or every ten seconds.
-fn options(name: &str) -> Vec<(&'static str, String)> {
+/// B-frames, no lookahead, a keyframe only on request or at the settings' interval.
+fn options(name: &str, c: &Config) -> Vec<(&'static str, String)> {
     match name {
         "h264_nvenc" => vec![
-            ("preset", "p4".into()),
+            ("preset", c.nvenc_preset.clone()),
             ("tune", "ull".into()),
-            ("profile", std::env::var("ODL_X264_PROFILE").unwrap_or("baseline".into())),
+            ("profile", c.h264_profile.clone()),
             ("rc", "cbr".into()),
             ("zerolatency", "1".into()),
             ("delay", "0".into()),
@@ -95,11 +101,9 @@ fn options(name: &str) -> Vec<(&'static str, String)> {
             ("no-scenecut", "1".into()),
         ],
         "libx264" => vec![
-            ("preset", "veryfast".into()),
+            ("preset", c.x264_preset.clone()),
             ("tune", "zerolatency".into()),
-            // WebRTC offers H.264 as 42e01f, constrained baseline level 3.1.
-            // ODL_X264_PROFILE=high trades that for about 10 % less bitrate.
-            ("profile", std::env::var("ODL_X264_PROFILE").unwrap_or("baseline".into())),
+            ("profile", c.h264_profile.clone()),
             ("forced-idr", "1".into()),
             // A scene-cut IDR is a bitrate spike nobody asked for; the
             // receiver asks with a PLI when it needs one.
@@ -131,9 +135,9 @@ fn options(name: &str) -> Vec<(&'static str, String)> {
     }
 }
 
-fn candidates(codec: Codec) -> Vec<&'static str> {
+fn candidates(codec: Codec, c: &Config) -> Vec<&'static str> {
     match codec {
-        Codec::H264 => h264_order(),
+        Codec::H264 => h264_order(c),
         Codec::Av1 => vec!["libsvtav1"],
         Codec::Vp8 => vec!["libvpx"],
         Codec::Vp9 => vec!["libvpx-vp9"],
@@ -142,9 +146,10 @@ fn candidates(codec: Codec) -> Vec<&'static str> {
 
 /// Opens the first of the codec's encoders that opens.
 fn open(s: &Settings) -> Result<(ff::encoder::Video, &'static str), String> {
+    let c = crate::settings::get();
     let mut errors = Vec::new();
-    for name in candidates(s.codec) {
-        match open_one(name, s) {
+    for name in candidates(s.codec, &c) {
+        match open_one(name, s, &c) {
             Ok(enc) => return Ok((enc, name)),
             Err(e) => errors.push(e),
         }
@@ -152,8 +157,8 @@ fn open(s: &Settings) -> Result<(ff::encoder::Video, &'static str), String> {
     Err(errors.join("; "))
 }
 
-fn open_one(name: &'static str, s: &Settings) -> Result<ff::encoder::Video, String> {
-    let options = options(name);
+fn open_one(name: &'static str, s: &Settings, c: &Config) -> Result<ff::encoder::Video, String> {
+    let options = options(name, c);
     let codec =
         ff::encoder::find_by_name(name).ok_or_else(|| format!("libavcodec has no {name}"))?;
     let mut ctx = ff::codec::context::Context::new_with_codec(codec)
@@ -165,7 +170,7 @@ fn open_one(name: &'static str, s: &Settings) -> Result<ff::encoder::Video, Stri
     ctx.set_format(ff::format::Pixel::YUV420P);
     ctx.set_time_base((s.fps_den as i32, s.fps_num as i32));
     ctx.set_frame_rate(Some((s.fps_num as i32, s.fps_den as i32)));
-    ctx.set_gop(10 * s.fps_num / s.fps_den.max(1));
+    ctx.set_gop(c.keyframe_secs * s.fps_num / s.fps_den.max(1));
     ctx.set_max_b_frames(0);
     // OBS converts to I420 with these, set in output.rs.
     ctx.set_colorspace(ff::color::Space::BT709);
@@ -207,7 +212,7 @@ impl Encoder {
 
     /// Follows `kbps` if the encoder can; libx264 and NVENC reconfigure on the next frame.
     pub fn follow_bitrate(&mut self, kbps: u32) {
-        let kbps = kbps.clamp(MIN_KBPS, MAX_KBPS);
+        let kbps = clamp_kbps(kbps);
         let old = self.settings.bitrate_kbps;
         if kbps == old {
             return;
