@@ -22,6 +22,17 @@ The first version ran OBS on the host with Looking Glass as the source. That pat
 
 In the guest, OBS captures the display itself as 16-bit float and tonemaps HDR to SDR in its own shaders, at the full 3840x2160, then scales to the 1280x720 output with the area filter. Looking Glass stays the user's view of the guest and is no longer in the stream.
 
+## HDR to SDR
+
+Decided 2026-10-25: the guest's display capture carries OBS's HDR Tone Mapping filter, transform "SDR MaxRGB", input maximum 1000 nits, output maximum 150 nits. OBS's own tonemap, Reinhard with the profile's SDR white level, put Windows' SDR white (desktop and HUD white, about 100 nits) at 143 of 255 with the white level at 300, the value measured in the 3840x2160 capture. A lower white level brightens it but flattens highlights, since Reinhard compresses everything above it.
+
+MaxRGB SDR is BT.2390's EETF: linear below a knee, then a roll-off that ends at the output maximum, which becomes 255. `phase0/tonemap.py` ports both tonemaps from OBS 33's shaders; it predicted 143 for Reinhard at 300 and 206 for this filter, and the screenshots measured 143 and 206. With this filter 1000 nits still lands below clipping. An output maximum of 120 gives 214 for SDR white and squeezes everything over 300 nits into 248 to 255.
+
+| Gray level, nits | 5 | 20 | 50 | 100 | 200 | 500 | 1000 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Reinhard, white level 300 | 46 | 80 | 113 | 143 | 174 | 210 | 229 |
+| MaxRGB SDR, 1000 to 150 | 62 | 110 | 161 | 206 | 236 | 253 | 255 |
+
 ## Encoders
 
 Picked by the codec the client names, which is the one Discord negotiated. Discord negotiates H264, so in practice it is the H264 row:
@@ -36,7 +47,7 @@ Picked by the codec the client names, which is the one Discord negotiated. Disco
 There is no settings UI. Two variables in OBS's environment change the H.264 encoder:
 
 - `ODL_X264_PROFILE=high` trades the baseline profile for about 10 % less bitrate, if the receivers accept it.
-- `ODL_H264_ENCODER=h264_nvenc` encodes on NVENC instead of libx264 (CBR, `p4`, `ull`, live bitrate changes). It is off by default: in the guest on 2026-10-24, each NVENC probe hung the passed-through RTX 3080 (`nvlddmkm` event 153), and the second hang ended the running game with `DXGI_ERROR_DEVICE_HUNG`. OBS's own NVENC module is moved out of the guest's install for the same reason.
+- `ODL_H264_ENCODER=h264_nvenc` encodes on NVENC instead of libx264 (CBR, `p4`, `ull`, live bitrate changes). It is off by default: in the guest on 2026-10-24, each NVENC probe hung the passed-through RTX 3080 (`nvlddmkm` event 153), and the second hang ended the running game with `DXGI_ERROR_DEVICE_HUNG`. OBS's own NVENC test program is moved out of the guest's install for the same reason.
 
 ## What Discord's Go Live sender is
 
@@ -81,6 +92,8 @@ The patch is the one commit on top of Vesktop 1.6.7's source; it changes no depe
 
 Copy `obs-plugins/obs-discord-live/bin/64bit/obs-discord-live.dll` from the result to `C:\ProgramData\obs-studio\plugins\obs-discord-live\bin\64bit\` in the guest, allow TCP 4457 from the host only, and start Vesktop with `OBS_DISCORD_LIVE_ADDR=<guest>:4457`.
 
+The guest's OBS setup: profile at base 3840x2160, output 1280x720, 30 fps, area scaling, NV12 709 partial range; one scene with a display capture of the monitor (DXGI, no cursor) and the filter from "HDR to SDR" above. OBS starts at logon from a scheduled task. `obs-nvenc-test.exe` is moved out of `bin\64bit`, so OBS skips NVENC without probing the GPU (see Encoders); the `obs-nvenc` module itself stays, because a missing core module stops OBS 33 from loading every core module after it in its list.
+
 ## Build and install for development
 
 ```sh
@@ -110,3 +123,5 @@ target/release/odl-client H264 2500 10 test-out/h.264 --keyframe-at 90 --bitrate
 | VP9 | 0, 90, 120, 180 | 2285 to 2931 | 788 to 1486 |
 
 VP8 does not get down to 800 kbps on this content; the cause is not measured yet. Zero frames dropped between OBS and the encoder in every run. Quitting OBS removes the socket and OBS reports 0 memory leaks.
+
+2026-10-25, OBS 33.0.0 in the adversary guest, the znver5 DLL from `nix build .#windows`, the guest profile above, the Windows desktop on screen (Warframe not running). `odl-client H264 2500 8` over an SSH tunnel to the guest's port 4457, a keyframe request after frame 90, 800 kbps from frame 120: libx264 constrained baseline 1280x720 yuv420p BT.709 limited range, keyframes at 0 and 90, 614 kbps after the drop, and ffmpeg decoded it without an error. OBS reported 240 output frames, 0 skipped, 0.31 ms average render time.
