@@ -1,0 +1,16 @@
+[package]
+name = "obs-discord-live"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format"] }
+odl-proto = { path = "../proto" }
+
+[build-dependencies]
+bindgen = "0.73"
+pkg-config = "0.3.34"

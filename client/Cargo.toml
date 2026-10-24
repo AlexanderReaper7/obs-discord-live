@@ -1,0 +1,8 @@
+[package]
+name = "odl-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+odl-proto = { path = "../proto" }

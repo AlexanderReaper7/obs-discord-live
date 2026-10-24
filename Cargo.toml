@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["plugin", "proto", "client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+# lto = "fat" is left off on the user's request of 2026-10-24, to keep builds short.
