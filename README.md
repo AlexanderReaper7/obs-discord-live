@@ -116,7 +116,7 @@ nix develop -c cargo build --release
 cp target/release/libobs_discord_live.so ~/.config/obs-studio/plugins/obs-discord-live/bin/64bit/obs-discord-live.so
 ```
 
-OBS loads it at start. `.cargo/config.toml` builds for `znver5`, the value nixcfg's `refresh-cpu` wrote for strix. LTO is off for build time; `lto = "fat"` in `Cargo.toml` turns it on.
+OBS loads it at start. With the nix plugin also installed, OBS finds two modules of the same name, so remove this copy after testing. `.cargo/config.toml` builds for `znver5`, the value nixcfg's `refresh-cpu` wrote for strix. LTO is off for build time; `lto = "fat"` in `Cargo.toml` turns it on.
 
 ## Test
 
